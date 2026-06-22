@@ -10,12 +10,30 @@
  * unbounded full Go processes (~70MB+ each).
  *
  * This module is a counting semaphore backed by a slot directory under the
- * workspace state dir. A worker acquires a slot (creating an exclusive
- * `<pid>.slot` file) before it spawns `agy`, and releases it after. Capacity 1
- * (the default) fully serializes same-workspace background jobs, which is what
- * removes the `last_conversations.json` race; a higher cap simply bounds
- * resource use. Holders whose pid is dead are reclaimed so a crashed worker
- * never wedges the queue.
+ * workspace state dir. Capacity 1 (the default) fully serializes same-workspace
+ * background jobs, which removes the `last_conversations.json` race; a higher
+ * cap simply bounds resource use.
+ *
+ * Mutual exclusion is provided by ATOMIC exclusive file creation, not by listing
+ * the directory and reasoning about who "won". The slots are a FIXED set of
+ * names `slot-0.slot` ... `slot-(N-1).slot`; a worker acquires by walking the
+ * indices and `open(..., "wx")` (O_EXCL) on each until one create succeeds. Only
+ * one process can ever win a given name, so two workers racing for the last slot
+ * cannot both succeed — there is no check-then-act window. This is the standard
+ * race-free file-lock primitive; an earlier "register then sort the directory"
+ * design was rejected because the read-after-register is not atomic (a worker
+ * that lists the dir before a peer's slot is visible can wrongly conclude it
+ * won). The owner pid is stored INSIDE the slot purely so a crashed worker's
+ * slot can be reclaimed; it is never used to decide who holds the lock.
+ *
+ * Known residual limitations (acceptable here; the slot dir is process-local):
+ *  - PID reuse: if a holder crashes and the OS recycles its pid to an unrelated
+ *    live process, reaping sees the pid as alive and the slot stays held until a
+ *    stale-grace reclaim or manual release. Jobs are short-lived and same-host,
+ *    so this is unlikely; a UUID owner token would be the full fix.
+ *  - Network filesystems: O_EXCL create and rename are not reliably atomic
+ *    across NFS clients. The workspace state dir is local, so this does not
+ *    apply; do not relocate it onto network storage without revisiting this.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -31,6 +49,15 @@ import { resolveStateDir } from "./state.mjs";
 export const DEFAULT_MAX_CONCURRENT_BACKGROUND_JOBS = 1;
 const SLOT_DIR_NAME = "slots";
 const SLOT_SUFFIX = ".slot";
+/**
+ * Grace before an UNPARSEABLE slot file is treated as an orphan and reclaimed.
+ * A slot is created empty by `open(wx)` and its pid payload is written a beat
+ * later; within this window an empty slot is assumed in-flight (a peer is
+ * mid-create) and is NOT reaped, which closes the half-written-slot race. Past
+ * the window an empty slot means the creator died between open and write, so it
+ * is reclaimed.
+ */
+const DEFAULT_INFLIGHT_GRACE_MS = 30_000;
 
 export function resolveSlotDir(cwd) {
   return path.join(resolveStateDir(cwd), SLOT_DIR_NAME);
@@ -56,11 +83,16 @@ function pidIsAlive(pid, killImpl) {
 }
 
 /**
- * Reclaim slot files whose owner pid is dead and return the live holder count.
+ * Reclaim slot files whose owner pid is dead (or whose empty payload is past the
+ * in-flight grace) and return the count of slots still held. Never reaps a slot
+ * that is merely mid-create.
  */
 function reapDeadSlots(slotDir, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
-  let live = 0;
+  const graceMs = Number.isFinite(options.inflightGraceMs)
+    ? options.inflightGraceMs
+    : DEFAULT_INFLIGHT_GRACE_MS;
+  let held = 0;
   let entries;
   try {
     entries = fs.readdirSync(slotDir);
@@ -72,26 +104,60 @@ function reapDeadSlots(slotDir, options = {}) {
       continue;
     }
     const slotPath = path.join(slotDir, entry);
-    let ownerPid = Number.NaN;
+    let raw;
     try {
-      ownerPid = Number(JSON.parse(fs.readFileSync(slotPath, "utf8")).pid);
+      raw = fs.readFileSync(slotPath, "utf8");
     } catch {
-      ownerPid = Number.NaN;
+      // Vanished under us (reaped/released by a peer); nothing to count.
+      continue;
     }
-    if (pidIsAlive(ownerPid, killImpl)) {
-      live += 1;
-    } else {
+
+    let ownerPid = Number.NaN;
+    if (raw.trim()) {
       try {
-        fs.unlinkSync(slotPath);
+        ownerPid = Number(JSON.parse(raw).pid);
       } catch {
-        // Another worker may have reclaimed it first; ignore.
+        ownerPid = Number.NaN;
       }
     }
+
+    if (Number.isFinite(ownerPid)) {
+      if (pidIsAlive(ownerPid, killImpl)) {
+        held += 1;
+      } else {
+        unlinkQuietly(slotPath);
+      }
+      continue;
+    }
+
+    // Empty / unparseable: a slot mid-create looks like this for a beat. Keep it
+    // while fresh (assume a peer is writing its pid); reclaim once it is stale.
+    if (isFresh(slotPath, graceMs)) {
+      held += 1;
+    } else {
+      unlinkQuietly(slotPath);
+    }
   }
-  return live;
+  return held;
 }
 
-/** Count currently-held (live) slots for the workspace. */
+function isFresh(slotPath, graceMs) {
+  try {
+    return Date.now() - fs.statSync(slotPath).mtimeMs < graceMs;
+  } catch {
+    return false;
+  }
+}
+
+function unlinkQuietly(slotPath) {
+  try {
+    fs.unlinkSync(slotPath);
+  } catch {
+    // Another worker may have reclaimed/released it first; ignore.
+  }
+}
+
+/** Count currently-held slots for the workspace (reaping dead holders first). */
 export function countActiveSlots(cwd, options = {}) {
   const slotDir = resolveSlotDir(cwd);
   if (!fs.existsSync(slotDir)) {
@@ -100,39 +166,7 @@ export function countActiveSlots(cwd, options = {}) {
   return reapDeadSlots(slotDir, options);
 }
 
-/**
- * Try to claim a slot without waiting. Returns a release handle, or null when
- * the workspace is already at capacity.
- */
-export function tryAcquireSlot(cwd, options = {}) {
-  const maxConcurrent = Number.isFinite(options.maxConcurrent)
-    ? Math.max(1, options.maxConcurrent)
-    : DEFAULT_MAX_CONCURRENT_BACKGROUND_JOBS;
-  const pid = Number.isFinite(options.pid) ? options.pid : process.pid;
-  const slotDir = ensureSlotDir(cwd);
-
-  // Reap dead holders first so a crashed worker never permanently blocks a slot.
-  const live = reapDeadSlots(slotDir, options);
-  if (live >= maxConcurrent) {
-    return null;
-  }
-
-  const slotPath = path.join(slotDir, `${pid}${SLOT_SUFFIX}`);
-  try {
-    // Exclusive create: two workers racing for the last slot cannot both win the
-    // same file name (different pids -> different names), and re-claiming our own
-    // pid's slot is idempotent enough for our single-acquire-per-worker usage.
-    const handle = fs.openSync(slotPath, "wx");
-    fs.writeFileSync(handle, JSON.stringify({ pid, claimedAt: new Date().toISOString() }));
-    fs.closeSync(handle);
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      // Our pid already holds a slot; treat as acquired (idempotent).
-    } else {
-      throw error;
-    }
-  }
-
+function makeReleaseHandle(pid, slotPath) {
   let released = false;
   return {
     pid,
@@ -142,13 +176,50 @@ export function tryAcquireSlot(cwd, options = {}) {
         return;
       }
       released = true;
-      try {
-        fs.unlinkSync(slotPath);
-      } catch {
-        // Already gone (reaped or released); nothing to do.
-      }
+      unlinkQuietly(slotPath);
     }
   };
+}
+
+/**
+ * Try to claim a slot without waiting. Returns a release handle, or null when
+ * every slot up to `maxConcurrent` is already held. Acquisition is atomic: the
+ * first worker to `open(slot-i, "wx")` wins slot i; racing peers get EEXIST and
+ * fall through to the next index (or null when the cap is reached).
+ */
+export function tryAcquireSlot(cwd, options = {}) {
+  const maxConcurrent = Number.isFinite(options.maxConcurrent)
+    ? Math.max(1, options.maxConcurrent)
+    : DEFAULT_MAX_CONCURRENT_BACKGROUND_JOBS;
+  const pid = Number.isFinite(options.pid) ? options.pid : process.pid;
+  const slotDir = ensureSlotDir(cwd);
+
+  // Reap dead holders first so a crashed worker never permanently blocks a slot.
+  reapDeadSlots(slotDir, options);
+
+  for (let index = 0; index < maxConcurrent; index += 1) {
+    const slotPath = path.join(slotDir, `slot-${index}${SLOT_SUFFIX}`);
+    let handle;
+    try {
+      // Atomic exclusive create: exactly one worker can win this name. No
+      // check-then-act window, so mutual exclusion holds even under a same-
+      // millisecond race for the final slot.
+      handle = fs.openSync(slotPath, "wx");
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        continue; // held by someone else (or in-flight); try the next index
+      }
+      throw error;
+    }
+    try {
+      fs.writeFileSync(handle, JSON.stringify({ pid, claimedAt: new Date().toISOString() }));
+    } finally {
+      fs.closeSync(handle);
+    }
+    return makeReleaseHandle(pid, slotPath);
+  }
+
+  return null;
 }
 
 function sleep(ms) {

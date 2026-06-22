@@ -86,7 +86,7 @@ test("a dead holder's slot is reclaimed so a crashed worker never wedges the que
   // Simulate a crashed worker that left a slot file for a pid that is gone.
   // pid 2^31-1 is effectively never a live process.
   const deadPid = 2147483646;
-  fs.writeFileSync(path.join(slotDir, `${deadPid}.slot`), JSON.stringify({ pid: deadPid }));
+  fs.writeFileSync(path.join(slotDir, "slot-0.slot"), JSON.stringify({ pid: deadPid }));
 
   // The reaper treats the dead holder as free, so a new job can still acquire.
   const handle = tryAcquireSlot(cwd, { pid: process.pid });
@@ -117,4 +117,47 @@ test("acquireSlot times out instead of hanging forever on a wedged queue", async
     /Timed out waiting for a free Antigravity job slot/
   );
   held.release();
+});
+
+test("acquisition is atomic: a fixed slot name is won by exactly one worker", () => {
+  const cwd = freshWorkspace();
+  const killImpl = aliveKill(111, 222, 333);
+  // Two workers race for the only slot (cap 1). Whoever wins `slot-0` via the
+  // atomic O_EXCL create holds it; the other gets null. There is no listing /
+  // sort step that could let both conclude they won. (Regression: web-review
+  // finding #1 — check-then-act break in the prior register-then-sort design.)
+  const a = tryAcquireSlot(cwd, { pid: 111, killImpl });
+  const b = tryAcquireSlot(cwd, { pid: 222, killImpl });
+  assert.ok(a, "first worker wins the slot");
+  assert.equal(b, null, "second worker cannot also win the same fixed slot");
+  const slots = fs.readdirSync(resolveSlotDir(cwd)).filter((f) => f.endsWith(".slot"));
+  assert.deepEqual(slots, ["slot-0.slot"], "exactly one slot file exists");
+  assert.equal(countActiveSlots(cwd, { killImpl }), 1);
+  a.release();
+});
+
+test("a freshly created empty slot is treated as in-flight, not reaped", () => {
+  const cwd = freshWorkspace();
+  const slotDir = resolveSlotDir(cwd);
+  fs.mkdirSync(slotDir, { recursive: true });
+  // A peer that just did open(wx) but has not written its pid yet looks like an
+  // empty slot. The reaper must NOT free it, or two workers could share a slot.
+  // (Regression: half-written-slot race.)
+  fs.writeFileSync(path.join(slotDir, "slot-0.slot"), "");
+  const blocked = tryAcquireSlot(cwd, { pid: 111 });
+  assert.equal(blocked, null, "a fresh empty (in-flight) slot must count as held");
+  assert.equal(countActiveSlots(cwd), 1);
+});
+
+test("a stale empty orphan slot is reclaimed once past the in-flight grace", () => {
+  const cwd = freshWorkspace();
+  const slotDir = resolveSlotDir(cwd);
+  fs.mkdirSync(slotDir, { recursive: true });
+  // An empty slot whose creator died between open and write: past the grace it
+  // is an orphan and must be reclaimed so it does not wedge the queue forever.
+  fs.writeFileSync(path.join(slotDir, "slot-0.slot"), "");
+  const handle = tryAcquireSlot(cwd, { pid: 111, inflightGraceMs: 0 });
+  assert.ok(handle, "a stale empty orphan must be reclaimed");
+  assert.equal(countActiveSlots(cwd, { killImpl: aliveKill(111) }), 1);
+  handle.release();
 });
