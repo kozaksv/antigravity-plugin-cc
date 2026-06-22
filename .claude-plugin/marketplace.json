@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Antigravity (agy) plugin for Claude Code: delegate tasks and review code.",
-    "version": "1.0.0"
+    "version": "1.0.1"
   },
   "plugins": [
     {
       "name": "antigravity",
       "description": "Use Antigravity (agy) from Claude Code to review code or delegate tasks.",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "author": {
         "name": "Sergii Kozak"
       },

@@ -1,6 +1,6 @@
 {
   "name": "antigravity",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Use Antigravity (agy) from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "Sergii Kozak"
