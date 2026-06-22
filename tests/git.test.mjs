@@ -3,7 +3,12 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { collectReviewContext, resolveReviewTarget } from "../plugins/codex/scripts/lib/git.mjs";
+import {
+  collectReviewContext,
+  resolveReviewTarget,
+  restoreWorkspaceSnapshot,
+  snapshotWorkspace
+} from "../plugins/antigravity/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
@@ -180,4 +185,61 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("snapshotWorkspace + restoreWorkspaceSnapshot roll back a turn's tracked edits", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'committed';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  // Pre-run user change that MUST be preserved across a rollback.
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'user-edit';\n");
+
+  const snapshot = snapshotWorkspace(cwd);
+  assert.ok(snapshot, "snapshot should capture the workspace");
+  assert.ok(snapshot.head, "snapshot should record HEAD");
+
+  // Simulate the write turn's half-applied patch on top of the user edit.
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'half-applied-by-agy';\n");
+
+  const result = restoreWorkspaceSnapshot(snapshot);
+  assert.equal(result.restored, true);
+
+  // The turn's edit is gone; the user's pre-run edit is restored.
+  const restored = fs.readFileSync(path.join(cwd, "app.js"), "utf8");
+  assert.match(restored, /user-edit/);
+  assert.doesNotMatch(restored, /half-applied-by-agy/);
+});
+
+test("restoreWorkspaceSnapshot leaves the tree in place when HEAD moved (new commits)", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'v1';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const snapshot = snapshotWorkspace(cwd);
+
+  // The turn committed new work; a blind reset would discard it, so restore must
+  // refuse and leave the tree for manual review.
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'turn-commit';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "turn made a commit"], { cwd });
+
+  const result = restoreWorkspaceSnapshot(snapshot);
+  assert.equal(result.restored, false);
+  assert.match(result.reason, /HEAD moved/);
+  assert.match(fs.readFileSync(path.join(cwd, "app.js"), "utf8"), /turn-commit/);
+});
+
+test("restoreWorkspaceSnapshot is a no-op for a null/invalid snapshot", () => {
+  assert.deepEqual(restoreWorkspaceSnapshot(null), { restored: false, reason: "no snapshot" });
+  assert.deepEqual(restoreWorkspaceSnapshot({}), { restored: false, reason: "no snapshot" });
+});
+
+test("snapshotWorkspace returns null outside a git repository", () => {
+  const cwd = makeTempDir();
+  assert.equal(snapshotWorkspace(cwd), null);
 });

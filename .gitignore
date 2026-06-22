@@ -147,4 +147,6 @@ vite.config.ts.timestamp-*
 .vite/
 
 output/
-plugins/codex/.generated/
+
+# Claude Code local settings
+.claude/

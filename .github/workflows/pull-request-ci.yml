@@ -25,11 +25,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Install Codex CLI
-        run: npm install -g @openai/codex
-
+      # No real `agy` is installed: the test suite spawns a fake `agy` fixture on
+      # PATH (see tests/fake-agy-fixture.mjs), so CI never depends on the live
+      # Antigravity CLI.
       - name: Run test suite
         run: npm test
-
-      - name: Run build
-        run: npm run build
