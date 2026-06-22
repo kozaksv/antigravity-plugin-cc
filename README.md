@@ -1,22 +1,18 @@
-# Codex plugin for Claude Code
+# Antigravity plugin for Claude Code
 
-Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex.
+Use Antigravity (`agy`) from inside Claude Code for code reviews or to delegate tasks to Antigravity.
 
-This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
-they already have.
-
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+This plugin is for Claude Code users who want an easy way to start using Google's Antigravity CLI from the workflow they already have.
 
 ## What You Get
 
-- `/codex:review` for a normal read-only Codex review
-- `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work and manage background jobs
+- `/antigravity:review` for a normal read-only Antigravity review
+- `/antigravity:adversarial-review` for a steerable challenge review
+- `/antigravity:rescue`, `/antigravity:status`, `/antigravity:result`, and `/antigravity:cancel` to delegate work and manage background jobs
 
 ## Requirements
 
-- **ChatGPT subscription (incl. Free) or OpenAI API key.**
-  - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
+- **A signed-in Antigravity CLI (`agy`).** Authentication is through your Google account (Code Assist OAuth). There is no API-key environment variable to set.
 - **Node.js 18.18 or later**
 
 ## Install
@@ -24,13 +20,13 @@ they already have.
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add kozaksv/antigravity-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install antigravity@antigravity
 ```
 
 Reload plugins:
@@ -42,41 +38,43 @@ Reload plugins:
 Then run:
 
 ```bash
-/codex:setup
+/antigravity:setup
 ```
 
-`/codex:setup` will tell you whether Codex is ready. If Codex is missing and npm is available, it can offer to install Codex for you.
+`/antigravity:setup` will tell you whether Antigravity is ready. If `agy` is missing, it can offer to install it for you.
 
-If you prefer to install Codex yourself, use:
+If you prefer to install `agy` yourself:
 
 ```bash
-npm install -g @openai/codex
+curl -fsSL https://antigravity.google/cli/install.sh | bash
 ```
 
-If Codex is installed but not logged in yet, run:
+If `agy` is installed but not signed in yet, run it interactively once and sign in with your Google account:
 
 ```bash
-!codex login
+agy
 ```
+
+`agy` detects SSH sessions and prints a sign-in URL when it cannot open a browser. There are no API-key environment variables — authentication is Google OAuth and the account state is stored under `~/.gemini/`.
 
 After install, you should see:
 
 - the slash commands listed below
-- the `codex:codex-rescue` subagent in `/agents`
+- the `antigravity:antigravity-rescue` subagent in `/agents`
 
 One simple first run is:
 
 ```bash
-/codex:review --background
-/codex:status
-/codex:result
+/antigravity:review --background
+/antigravity:status
+/antigravity:result
 ```
 
 ## Usage
 
-### `/codex:review`
+### `/antigravity:review`
 
-Runs a normal Codex review on your current work. It gives you the same quality of code review as running `/review` inside Codex directly.
+Runs a normal Antigravity review on your current work.
 
 > [!NOTE]
 > Code review especially for multi-file changes might take a while. It's generally recommended to run it in the background.
@@ -86,26 +84,25 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/antigravity:adversarial-review`](#antigravityadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
 ```bash
-/codex:review
-/codex:review --base main
-/codex:review --background
+/antigravity:review
+/antigravity:review --base main
+/antigravity:review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/codex:status`](#codexstatus) to check on the progress and [`/codex:cancel`](#codexcancel) to cancel the ongoing task.
+This command is read-only and will not perform any changes. When run in the background you can use [`/antigravity:status`](#antigravitystatus) to check on the progress and [`/antigravity:cancel`](#antigravitycancel) to cancel the ongoing task.
 
-### `/codex:adversarial-review`
+### `/antigravity:adversarial-review`
 
 Runs a **steerable** review that questions the chosen implementation and design.
 
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
-It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It uses the same review target selection as `/antigravity:review`, including `--base <ref>` for branch review. It also supports `--wait` and `--background`. Unlike `/antigravity:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -116,61 +113,61 @@ Use it when you want:
 Examples:
 
 ```bash
-/codex:adversarial-review
-/codex:adversarial-review --base main challenge whether this was the right caching and retry design
-/codex:adversarial-review --background look for race conditions and question the chosen approach
+/antigravity:adversarial-review
+/antigravity:adversarial-review --base main challenge whether this was the right caching and retry design
+/antigravity:adversarial-review --background look for race conditions and question the chosen approach
 ```
 
 This command is read-only. It does not fix code.
 
-### `/codex:rescue`
+### `/antigravity:rescue`
 
-Hands a task to Codex through the `codex:codex-rescue` subagent.
+Hands a task to Antigravity through the `antigravity:antigravity-rescue` subagent.
 
-Use it when you want Codex to:
+Use it when you want Antigravity to:
 
 - investigate a bug
 - try a fix
-- continue a previous Codex task
+- continue a previous Antigravity task
 - take a faster or cheaper pass with a smaller model
 
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo. Resume is **native** to `agy` — the plugin reuses the existing Antigravity conversation rather than replaying history.
 
 Examples:
 
 ```bash
-/codex:rescue investigate why the tests started failing
-/codex:rescue fix the failing test with the smallest safe patch
-/codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
-/codex:rescue --background investigate the regression
+/antigravity:rescue investigate why the tests started failing
+/antigravity:rescue fix the failing test with the smallest safe patch
+/antigravity:rescue --resume apply the top fix from the last run
+/antigravity:rescue --model "Gemini 3.5 Flash (High)" investigate the flaky integration test
+/antigravity:rescue --model spark fix the issue quickly
+/antigravity:rescue --background investigate the regression
 ```
 
-You can also just ask for a task to be delegated to Codex:
+You can also just ask for a task to be delegated to Antigravity:
 
 ```text
-Ask Codex to redesign the database connection to be more resilient.
+Ask Antigravity to redesign the database connection to be more resilient.
 ```
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
-- follow-up rescue requests can continue the latest Codex task in the repo
+- if you do not pass `--model`, Antigravity uses its own default (`Gemini 3.5 Flash (Medium)`).
+- if you say `spark`, the plugin maps that to the Antigravity lite model `Gemini 3.5 Flash (Low)`
+- follow-up rescue requests can continue the latest Antigravity conversation in the repo
 
-### `/codex:status`
+### `/antigravity:status`
 
-Shows running and recent Codex jobs for the current repository.
+Shows running and recent Antigravity jobs for the current repository.
 
 Examples:
 
 ```bash
-/codex:status
-/codex:status task-abc123
+/antigravity:status
+/antigravity:status task-abc123
 ```
 
 Use it to:
@@ -179,127 +176,136 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
-### `/codex:result`
+### `/antigravity:result`
 
-Shows the final stored Codex output for a finished job.
-When available, it also includes the Codex session ID so you can reopen that run directly in Codex with `codex resume <session-id>`.
-
-Examples:
-
-```bash
-/codex:result
-/codex:result task-abc123
-```
-
-### `/codex:cancel`
-
-Cancels an active background Codex job.
+Shows the final stored Antigravity output for a finished job.
+When available, it also includes the Antigravity conversation ID so you can reopen that run directly with `agy --conversation <id> -p` (or `agy -c` for the most recent conversation in that directory).
 
 Examples:
 
 ```bash
-/codex:cancel
-/codex:cancel task-abc123
+/antigravity:result
+/antigravity:result task-abc123
 ```
 
-### `/codex:setup`
+### `/antigravity:cancel`
 
-Checks whether Codex is installed and authenticated.
-If Codex is missing and npm is available, it can offer to install Codex for you.
+Cancels an active background Antigravity job. Cancellation performs a process-tree kill (`SIGTERM`, then `SIGKILL` after a short grace period) so the underlying `agy` process is really stopped.
 
-You can also use `/codex:setup` to manage the optional review gate.
+Examples:
+
+```bash
+/antigravity:cancel
+/antigravity:cancel task-abc123
+```
+
+### `/antigravity:setup`
+
+Checks whether Antigravity is installed and authenticated.
+If `agy` is missing, it can offer to install it for you.
+
+You can also use `/antigravity:setup` to manage the optional review gate.
 
 #### Enabling review gate
 
 ```bash
-/codex:setup --enable-review-gate
-/codex:setup --disable-review-gate
+/antigravity:setup --enable-review-gate
+/antigravity:setup --disable-review-gate
 ```
 
-When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Codex review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
+When the review gate is enabled, the plugin uses a `Stop` hook to run a targeted Antigravity review based on Claude's response. If that review finds issues, the stop is blocked so Claude can address them first.
 
 > [!WARNING]
-> The review gate can create a long-running Claude/Codex loop and may drain usage limits quickly. Only enable it when you plan to actively monitor the session.
+> The review gate can create a long-running Claude/Antigravity loop and may drain usage quickly. Only enable it when you plan to actively monitor the session.
 
 ## Typical Flows
 
 ### Review Before Shipping
 
 ```bash
-/codex:review
+/antigravity:review
 ```
 
-### Hand A Problem To Codex
+### Hand A Problem To Antigravity
 
 ```bash
-/codex:rescue investigate why the build is failing in CI
+/antigravity:rescue investigate why the build is failing in CI
 ```
 
 ### Start Something Long-Running
 
 ```bash
-/codex:adversarial-review --background
-/codex:rescue --background investigate the flaky test
+/antigravity:adversarial-review --background
+/antigravity:rescue --background investigate the flaky test
 ```
 
 Then check in with:
 
 ```bash
-/codex:status
-/codex:result
+/antigravity:status
+/antigravity:result
 ```
 
-## Codex Integration
+## Antigravity Integration
 
-The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
+The plugin uses the global `agy` binary installed in your environment. Each turn is a one-shot, non-interactive run (`agy -p "<prompt>"`); there is no persistent server or app-server process. The plugin spawns `agy` directly (argv array, no shell), captures its stdout, and owns its own timeout and process-tree cancellation.
 
-### Common Configurations
+Output is parsed from `agy`'s plain-text stdout using explicit result markers (`===ANTIGRAVITY_RESULT_BEGIN===` / `===ANTIGRAVITY_RESULT_END===`). If those markers are missing, the plugin falls back to reading the structured conversation transcript at `~/.gemini/antigravity-cli/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`.
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
+### Models
 
-```toml
-model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
-```
+`agy` exposes a fixed set of model labels (see `agy models`):
 
-Your configuration will be picked up based on:
+- `Gemini 3.5 Flash (Low|Medium|High)`
+- `Gemini 3.1 Pro (Low|High)`
+- `Claude Sonnet 4.6 (Thinking)`
+- `Claude Opus 4.6 (Thinking)`
+- `GPT-OSS 120B (Medium)`
 
-- user-level config in `~/.codex/config.toml`
-- project-level overrides in `.codex/config.toml`
-- project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
+Pass a label verbatim with `--model`, or use one of the plugin's short aliases: `flash`, `flash-high`, `flash-low`, `pro`, `pro-low`, `sonnet`, `opus`, and `spark` (→ `Gemini 3.5 Flash (Low)`). When you omit `--model`, Antigravity uses its default (`Gemini 3.5 Flash (Medium)`).
 
-Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
+### Configuration and state
 
-### Moving The Work Over To Codex
+`agy` shares the Gemini CLI home directory. Its configuration and per-conversation state live under:
 
-Delegated tasks and any [stop gate](#what-does-the-review-gate-do) run can also be directly resumed inside Codex by running `codex resume` either with the specific session ID you received from running `/codex:result` or `/codex:status` or by selecting it from the list.
+- `~/.gemini/` — account state (`google_accounts.json`), shared `settings.json`, trusted folders.
+- `~/.gemini/antigravity-cli/` — Antigravity-specific data: `settings.json`, the cwd→conversation map (`cache/last_conversations.json`), per-conversation SQLite databases (`conversations/<id>.db`), and JSONL transcripts (`brain/<id>/...`).
 
-This way you can review the Codex work or continue the work there.
+There is no `~/.codex/config.toml` equivalent and no `~/.antigravity/` directory — everything is under `~/.gemini/`.
+
+### Resuming a conversation in Antigravity
+
+Delegated tasks and any [stop gate](#enabling-review-gate) run can be resumed directly with the `agy` CLI:
+
+- `agy -c -p "<follow-up>"` continues the most recent conversation in the current directory.
+- `agy --conversation <id> -p "<follow-up>"` resumes a specific conversation by the ID shown in `/antigravity:result` or `/antigravity:status`.
+
+This way you can review the Antigravity work or continue it directly in the CLI.
+
+## Caveats
+
+- **Prompt is passed via argv.** `agy -p` does not read from stdin. Very long prompts are subject to your OS `ARG_MAX` limit, so the plugin hard-caps the prompt at 128 KiB before spawning `agy`. Large reviews stay under the cap by automatically switching from an inline diff to a lightweight summary that asks Antigravity to inspect the diff itself; a prompt that would still exceed the cap is rejected with a clear error instead of an opaque spawn failure.
+- **No JSON output mode.** `agy` has no `--output-format json` flag. The plugin relies on marker-based plain-text parsing with the transcript JSONL as a fallback, not on a structured CLI flag.
+- **`--print-timeout` is advisory.** It does not reliably kill a stuck `agy` process, so the plugin enforces its own external timeout and process-tree kill.
 
 ## FAQ
 
-### Do I need a separate Codex account for this plugin?
+### Do I need a separate account for this plugin?
 
-If you are already signed into Codex on this machine, that account should work immediately here too. This plugin uses your local Codex CLI authentication.
+If you are already signed into Antigravity (`agy`) on this machine, that account works here too. This plugin uses your local `agy` authentication.
 
-If you only use Claude Code today and have not used Codex yet, you will also need to sign in to Codex with either a ChatGPT account or an API key. [Codex is available with your ChatGPT subscription](https://developers.openai.com/codex/pricing/), and [`codex login`](https://developers.openai.com/codex/cli/reference/#codex-login) supports both ChatGPT and API key sign-in. Run `/codex:setup` to check whether Codex is ready, and use `!codex login` if it is not.
+If you have not used `agy` yet, run it once interactively and sign in with your Google account. Run `/antigravity:setup` to check whether Antigravity is ready.
 
-### Does the plugin use a separate Codex runtime?
+### Does the plugin use a separate Antigravity runtime?
 
-No. This plugin delegates through your local [Codex CLI](https://developers.openai.com/codex/cli/) and [Codex app server](https://developers.openai.com/codex/app-server/) on the same machine.
+No. This plugin delegates through your local `agy` CLI on the same machine.
 
 That means:
 
-- it uses the same Codex install you would use directly
-- it uses the same local authentication state
+- it uses the same `agy` install you would use directly
+- it uses the same local authentication state under `~/.gemini/`
 - it uses the same repository checkout and machine-local environment
 
-### Will it use the same Codex config I already have?
+### Will it use the same Antigravity config I already have?
 
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
-
-### Can I keep using my current API key or base URL setup?
-
-Yes. Because the plugin uses your local Codex CLI, your existing sign-in method and config still apply.
-
-If you need to point the built-in OpenAI provider at a different endpoint, set `openai_base_url` in your [Codex config](https://developers.openai.com/codex/config-advanced/#config-and-state-locations).
+Yes. The plugin runs your local `agy` binary, so it picks up the same configuration and signed-in account under `~/.gemini/`.

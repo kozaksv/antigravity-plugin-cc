@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-export function makeTempDir(prefix = "codex-plugin-test-") {
+export function makeTempDir(prefix = "antigravity-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
@@ -24,8 +24,11 @@ export function run(command, args, options = {}) {
 }
 
 export function initGitRepo(cwd) {
-  run("git", ["init", "-b", "main"], { cwd });
-  run("git", ["config", "user.name", "Codex Plugin Tests"], { cwd });
+  // `git init -b main` needs git >= 2.28; set the unborn branch explicitly so
+  // the suite also runs on older git versions.
+  run("git", ["init"], { cwd });
+  run("git", ["symbolic-ref", "HEAD", "refs/heads/main"], { cwd });
+  run("git", ["config", "user.name", "Antigravity Plugin Tests"], { cwd });
   run("git", ["config", "user.email", "tests@example.com"], { cwd });
   run("git", ["config", "commit.gpgsign", "false"], { cwd });
   run("git", ["config", "tag.gpgsign", "false"], { cwd });
