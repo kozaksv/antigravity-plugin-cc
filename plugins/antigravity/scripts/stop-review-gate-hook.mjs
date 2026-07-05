@@ -94,6 +94,30 @@ function parseStopReviewOutput(rawOutput) {
   };
 }
 
+/**
+ * `task --json`'s stdout is normally the structured payload (see
+ * antigravity-companion.mjs's `executeTaskRun`), which carries a human-readable
+ * `error.message` (e.g. QUOTA_EXHAUSTED) whenever the turn failed. Prefer that
+ * over the raw stdout/stderr dump so a stop-gate block reason is actionable
+ * instead of an opaque JSON blob; fall back to the raw dump when stdout is not
+ * (or no longer) parseable JSON, or carries no usable error message.
+ */
+function extractTaskFailureDetail(result) {
+  const rawStdout = String(result.stdout ?? "").trim();
+  if (rawStdout) {
+    try {
+      const payload = JSON.parse(rawStdout);
+      const message = String(payload?.error?.message ?? "").trim();
+      if (message) {
+        return message;
+      }
+    } catch {
+      // stdout was not JSON (or was cut off) — fall through to the raw dump.
+    }
+  }
+  return String(result.stderr || result.stdout || "").trim();
+}
+
 function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "antigravity-companion.mjs");
   const prompt = buildStopReviewPrompt(input);
@@ -117,7 +141,7 @@ function runStopReview(cwd, input = {}) {
   }
 
   if (result.status !== 0) {
-    const detail = String(result.stderr || result.stdout || "").trim();
+    const detail = extractTaskFailureDetail(result);
     return {
       ok: false,
       reason: detail

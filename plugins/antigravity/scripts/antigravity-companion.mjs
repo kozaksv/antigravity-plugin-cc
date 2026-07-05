@@ -382,14 +382,16 @@ async function executeReviewRun(request) {
         status: result.status,
         stderr: result.stderr,
         stdout: result.reviewText,
-        reasoning: result.reasoningSummary
+        reasoning: result.reasoningSummary,
+        error: result.error ?? null
       }
     };
     const rendered = renderNativeReviewResult(
       {
         status: result.status,
         stdout: result.reviewText,
-        stderr: result.stderr
+        stderr: result.stderr,
+        error: result.error
       },
       { reviewLabel: reviewName, targetLabel: target.label, reasoningSummary: result.reasoningSummary }
     );
@@ -400,7 +402,7 @@ async function executeReviewRun(request) {
       turnId: result.turnId,
       payload,
       rendered,
-      summary: firstMeaningfulLine(result.reviewText, `${reviewName} completed.`),
+      summary: firstMeaningfulLine(result.reviewText, firstMeaningfulLine(result.error?.message, `${reviewName} completed.`)),
       jobTitle: `Antigravity ${reviewName}`,
       jobClass: "review",
       targetLabel: target.label
@@ -531,7 +533,12 @@ async function executeTaskRun(request) {
     threadId: result.threadId,
     rawOutput,
     touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
+    reasoningSummary: result.reasoningSummary,
+    // Mirrors executeReviewRun's payload: without this, a caller that only has
+    // `task --json` (e.g. stop-review-gate-hook.mjs) sees an empty rawOutput on
+    // failure with no way to learn why — even though runOneShot already
+    // computed a clear, actionable error (e.g. QUOTA_EXHAUSTED).
+    error: result.error ?? null
   };
 
   return {

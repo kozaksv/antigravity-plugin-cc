@@ -102,6 +102,65 @@ function cleanStderr(stderr) {
     .join("\n");
 }
 
+/** Cap on how much of the `--log-file` tail we ever read (see readAgyLogFile). */
+const MAX_LOG_TAIL_BYTES = 1024 * 1024;
+
+/**
+ * Best-effort read of the per-turn `--log-file`; never throws. Reads only the
+ * LAST `MAX_LOG_TAIL_BYTES` of the file, not the whole thing: a quota-retry
+ * turn can run for the full 15-minute timeout with agy's verbose Go logger
+ * appending the entire time, so the file can grow arbitrarily large. The
+ * RESOURCE_EXHAUSTED line we look for repeats throughout such a log and always
+ * appears near the very end (agy keeps retrying until the turn dies), so the
+ * tail alone is sufficient — this deliberately will not find a signal that
+ * appears ONLY earlier in an oversized file. The tail may start mid-line (or
+ * mid multi-byte character); that is fine since we only pattern-match ASCII.
+ */
+export function readAgyLogFile(logFilePath) {
+  if (!logFilePath) {
+    return "";
+  }
+  let fd;
+  try {
+    fd = fs.openSync(logFilePath, "r");
+    const { size } = fs.fstatSync(fd);
+    const start = Math.max(0, size - MAX_LOG_TAIL_BYTES);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    let bytesRead = 0;
+    while (bytesRead < length) {
+      const n = fs.readSync(fd, buffer, bytesRead, length - bytesRead, start + bytesRead);
+      if (n === 0) {
+        break; // EOF reached earlier than fstat reported; use what we got.
+      }
+      bytesRead += n;
+    }
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // already closed, or never opened successfully — nothing to do
+      }
+    }
+  }
+}
+
+/** Best-effort cleanup of the per-turn `--log-file`; a leftover temp file is harmless. */
+function cleanupAgyLogFile(logFilePath) {
+  if (!logFilePath) {
+    return;
+  }
+  try {
+    fs.unlinkSync(logFilePath);
+  } catch {
+    // already gone, or never created — nothing to do
+  }
+}
+
 function shorten(text, limit = 96) {
   const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
   if (!normalized) {
@@ -237,6 +296,28 @@ export function detectBogusConversationWarning(stderr) {
   return /conversation\b.*\b(not found|does not exist)/i.test(String(stderr ?? ""));
 }
 
+const QUOTA_EXHAUSTED_RE = /RESOURCE_EXHAUSTED|Individual quota reached/i;
+// Go's time.Duration.String() omits leading zero-value components, so a
+// sub-hour reset prints as "12m34s" (no hours) or "45s" (no hours or minutes),
+// and can carry a fractional second (e.g. "1.5s"). Every component but the
+// trailing seconds is therefore optional.
+const QUOTA_RESET_RE = /Resets in ((?:[0-9]+h)?(?:[0-9]+m)?[0-9]+(?:\.[0-9]+)?s)/i;
+
+/**
+ * Detect agy's RESOURCE_EXHAUSTED (429) quota message. This never reaches the
+ * process's own stdout/stderr or exit code (agy retries a few times and then
+ * exits 0 with nothing usable) — it only appears in agy's own verbose log,
+ * which the runner captures via `--log-file` (see readAgyLogFile).
+ */
+export function detectQuotaExhaustion(logText) {
+  const normalized = String(logText ?? "");
+  if (!normalized || !QUOTA_EXHAUSTED_RE.test(normalized)) {
+    return null;
+  }
+  const resetMatch = normalized.match(QUOTA_RESET_RE);
+  return { resetsIn: resetMatch ? resetMatch[1] : null };
+}
+
 function buildAgyArgs(prompt, options = {}) {
   const args = ["-p", prompt, "--print-timeout", options.printTimeout ?? PRINT_TIMEOUT];
 
@@ -266,7 +347,60 @@ function buildAgyArgs(prompt, options = {}) {
     args.push("--dangerously-skip-permissions");
   }
 
+  // Routes agy's verbose Go log to a path we control, so a turn that produces
+  // no usable stdout (e.g. RESOURCE_EXHAUSTED, which agy never surfaces on
+  // stdout/stderr/exit-code) can still be diagnosed after the fact.
+  if (options.logFilePath) {
+    args.push("--log-file", options.logFilePath);
+  }
+
   return args;
+}
+
+/**
+ * Guard against an external kill of THIS process (a Bash-tool timeout, a CI
+ * step timeout, `feature-pipeline`'s own wrapping timeout, Ctrl-C, ...)
+ * orphaning the detached `agy` child. `agy` is spawned `detached: true` in its
+ * own process group specifically so our OWN timeout above can signal it as a
+ * group — but that same detachment means an external SIGTERM/SIGINT to only
+ * this process's pid never reaches `agy`, which then runs forever (its
+ * `--print-timeout` is advisory, not a hard kill; see docs/agy-cli.md). Install
+ * this for the lifetime of the child and forward the signal before we exit.
+ *
+ * This guard is POSIX-only. On win32, Node emulates an externally-sent SIGTERM
+ * as a hard `TerminateProcess`, so no JS `SIGTERM`/`SIGINT` listener ever runs
+ * — the handler below is simply never invoked. That is acceptable there: `agy`
+ * is also not spawned `detached` on win32 (see the `spawn` call below), so it
+ * shares this process's console/job object instead of living in its own
+ * detached group, and is not at risk of being orphaned the way a detached
+ * POSIX child is.
+ */
+function installExternalKillGuard(getChildPid) {
+  const handler = (signal) => {
+    const pid = getChildPid();
+    if (Number.isFinite(pid)) {
+      // Non-blocking SIGTERM only (escalate: false): this process is agy's
+      // actual OS parent, so the default synchronous SIGTERM->grace->SIGKILL
+      // escalation would block on Atomics.wait — freezing the very event loop
+      // that reaps agy via SIGCHLD. That turns a clean, instant death into a
+      // zombie for the entire grace window (kill(pid, 0) reports a zombie as
+      // alive), which we'd otherwise wait out for nothing. Fire-and-forget
+      // instead; docs/agy-cli.md's own testing found a single SIGTERM
+      // sufficient to kill a live `agy` (no SIGKILL needed) — that SIGTERM is
+      // what ends it, not reparenting. Reparenting to init on our exit does
+      // not hasten a live agy's death; it only guarantees the resulting
+      // zombie gets reaped once we are gone, since reaping applies to an
+      // already-exited (zombie) process, not a live one.
+      terminateProcessTree(pid, { escalate: false });
+    }
+    process.exit(signal === "SIGINT" ? 130 : 143);
+  };
+  process.on("SIGTERM", handler);
+  process.on("SIGINT", handler);
+  return () => {
+    process.off("SIGTERM", handler);
+    process.off("SIGINT", handler);
+  };
 }
 
 /**
@@ -284,6 +418,15 @@ function spawnAgyTurn(cwd, prompt, options = {}) {
       detached: process.platform !== "win32",
       windowsHide: true
     });
+
+    // Install the external-kill guard BEFORE onSpawn below. onSpawn (job-file
+    // bookkeeping) does several synchronous fs calls that can take a few ms —
+    // an external SIGTERM landing in that window, before this process has any
+    // SIGTERM listener, would hit Node's default disposition (immediate exit)
+    // and skip the guard entirely, leaving agy unprotected. Registering first
+    // closes that race (proven flaky in testing: the child's own startup can
+    // finish, and get signalled, before a listener-after-bookkeeping ever runs).
+    const removeExternalKillGuard = installExternalKillGuard(() => child.pid);
 
     // Surface the real `agy` child pid so the caller can persist it for cancel.
     // The Node wrapper's `process.pid` is NOT the agy process (and on a detached
@@ -339,6 +482,7 @@ function spawnAgyTurn(cwd, prompt, options = {}) {
       if (killTimer) {
         clearTimeout(killTimer);
       }
+      removeExternalKillGuard();
       resolve({
         status: spawnError ? 1 : code ?? (signal ? 1 : 0),
         signal: signal ?? null,
@@ -504,6 +648,10 @@ async function runOneShot(cwd, options = {}) {
   }
 
   emitProgress(options.onProgress, "Running `agy -p`.", "running");
+  const logFilePath = path.join(
+    os.tmpdir(),
+    `antigravity-agy-log-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.log`
+  );
   const result = await spawnAgyTurn(cwd, prompt, {
     env,
     model: options.model,
@@ -517,7 +665,8 @@ async function runOneShot(cwd, options = {}) {
     resumeConversationId,
     resumeWithContinue,
     timeoutMs: options.timeoutMs,
-    onSpawn: options.onSpawn
+    onSpawn: options.onSpawn,
+    logFilePath
   });
 
   // After a turn `agy` records the cwd -> conversation id mapping; surface it as
@@ -569,12 +718,31 @@ async function runOneShot(cwd, options = {}) {
       outputSource = "stdout";
     }
   }
-  if (!error && !finalMessage) {
-    error = {
-      message:
-        "`agy` exited successfully but produced no result marker, no usable stdout, and no transcript output."
-    };
+  // agy can swallow a RESOURCE_EXHAUSTED (429) turn entirely: exit 0, empty
+  // stdout, no transcript — nothing on any channel this runner already reads.
+  // Whenever the turn produced nothing usable, check its verbose log (routed to
+  // logFilePath above) before settling for the generic message; the quota
+  // signal is strictly more actionable than any error assembled above,
+  // including a timeout (agy can spend the whole timeout window retrying a
+  // quota it will never recover from within the turn).
+  if (!finalMessage) {
+    const quota = detectQuotaExhaustion(readAgyLogFile(logFilePath));
+    if (quota) {
+      error = {
+        code: "QUOTA_EXHAUSTED",
+        retryable: false,
+        message: quota.resetsIn
+          ? `Antigravity quota exhausted (RESOURCE_EXHAUSTED). Resets in ${quota.resetsIn}. Not retryable until then.`
+          : "Antigravity quota exhausted (RESOURCE_EXHAUSTED). Not retryable right now."
+      };
+    } else if (!error) {
+      error = {
+        message:
+          "`agy` exited successfully but produced no result marker, no usable stdout, and no transcript output."
+      };
+    }
   }
+  cleanupAgyLogFile(logFilePath);
 
   const status = error ? 1 : 0;
   if (status === 0) {

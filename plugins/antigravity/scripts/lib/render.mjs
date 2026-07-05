@@ -297,6 +297,8 @@ export function renderNativeReviewResult(result, meta) {
 
   if (stdout) {
     lines.push(stdout);
+  } else if (result.error?.message) {
+    lines.push(`Antigravity review failed: ${result.error.message}`);
   } else if (result.status === 0) {
     lines.push("Antigravity review completed without any stdout output.");
   } else {

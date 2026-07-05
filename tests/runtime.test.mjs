@@ -3,14 +3,16 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
 
 import {
   buildEnv,
   installFakeAgy,
   FIXTURE_CONVERSATION_ID,
+  QUOTA_RESET_WINDOW,
   RESULT_BEGIN_MARKER
 } from "./fake-agy-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { isAlive, makeTempDir, run, waitForDeath } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "antigravity");
@@ -25,6 +27,8 @@ const {
   readConversationIdForCwd,
   readTranscriptOutput,
   detectBogusConversationWarning,
+  detectQuotaExhaustion,
+  readAgyLogFile,
   runReview,
   runTurn,
   parseStructuredOutput,
@@ -196,6 +200,92 @@ test("detectBogusConversationWarning recognizes agy's not-found warning", () => 
   assert.equal(detectBogusConversationWarning("all good"), false);
 });
 
+test("detectQuotaExhaustion recognizes agy's RESOURCE_EXHAUSTED log line and extracts the reset window", () => {
+  const logText =
+    "Encountered retryable api error. retrying in 1.8s. Error: RESOURCE_EXHAUSTED (code 429): " +
+    "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 3h59m59s.";
+  const result = detectQuotaExhaustion(logText);
+  assert.ok(result);
+  assert.equal(result.resetsIn, "3h59m59s");
+
+  assert.equal(detectQuotaExhaustion("all good, no errors here"), null);
+  assert.equal(detectQuotaExhaustion(""), null);
+
+  // Go's time.Duration.String() omits leading zero-value components, so a
+  // sub-hour reset prints as "12m34s" (no "h") or "45s" (no "h" or "m") — not
+  // always the full "h..m..s" shape the regex must also still accept.
+  assert.equal(
+    detectQuotaExhaustion(
+      "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 12m34s."
+    ).resetsIn,
+    "12m34s"
+  );
+  assert.equal(
+    detectQuotaExhaustion(
+      "RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 45s."
+    ).resetsIn,
+    "45s"
+  );
+});
+
+test("readAgyLogFile reads only the tail of an oversized --log-file", () => {
+  const logPath = path.join(makeTempDir("antigravity-logtail-"), "agy.log");
+  // Filler well over the intended tail cap; the real RESOURCE_EXHAUSTED signal
+  // is appended only at the very end, mirroring real agy (it keeps retrying
+  // until the turn dies, so the terminal quota line is always near EOF).
+  const filler = "I0704 00:00:00.000000 1 noise.go:1] retrying, nothing to see here\n".repeat(20000);
+  const quotaTail =
+    "E0704 23:59:59.000000 1 log.go:398] agent executor error: model unreachable: RESOURCE_EXHAUSTED (code 429): " +
+    "Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h3m4s.\n";
+  fs.writeFileSync(logPath, filler + quotaTail, "utf8");
+  const fileSizeBytes = fs.statSync(logPath).size;
+  assert.ok(fileSizeBytes > 1024 * 1024, "test log must exceed the intended tail cap to be meaningful");
+
+  const text = readAgyLogFile(logPath);
+  // The whole point of the cap: never materialize the entire oversized file.
+  assert.ok(text.length < fileSizeBytes, "readAgyLogFile must not read the entire oversized log file");
+
+  const quota = detectQuotaExhaustion(text);
+  assert.ok(quota, "the quota signal near EOF must still be found within the tail");
+  assert.equal(quota.resetsIn, "2h3m4s");
+});
+
+test("runTurn surfaces a QUOTA_EXHAUSTED error when agy exits 0 with empty output but its log shows RESOURCE_EXHAUSTED", async () => {
+  const { env, cwd, argvLog } = withFakeAgy({ behavior: "quota-exhausted" });
+  const result = await runTurn(cwd, { prompt: "review please", env });
+
+  // Real agy: exit 0, no marker, no transcript — must NOT read as generic
+  // "no usable output"; the verbose log (via --log-file) names the real cause.
+  assert.equal(result.status, 1);
+  assert.ok(result.error);
+  assert.equal(result.error.code, "QUOTA_EXHAUSTED");
+  assert.equal(result.error.retryable, false);
+  assert.match(result.error.message, /quota/i);
+  assert.match(result.error.message, new RegExp(QUOTA_RESET_WINDOW));
+
+  const invocations = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  const lastArgv = invocations.at(-1);
+  assert.ok(lastArgv.includes("--log-file"), `expected --log-file in ${JSON.stringify(lastArgv)}`);
+});
+
+test("runTurn does not classify a turn as QUOTA_EXHAUSTED when it still produced a usable final message", async () => {
+  // Invariant-pinning test, not a regression reproduction: this passes against
+  // today's code already, because the quota-log check in runOneShot is gated
+  // behind `if (!finalMessage)`. The fixture's log contains the exact same
+  // RESOURCE_EXHAUSTED content as "quota-exhausted" (a transient retry that
+  // shows up in the verbose log), but the turn still succeeds — a log that
+  // merely MENTIONS RESOURCE_EXHAUSTED must never override real output. This
+  // guards that gate against a future refactor that starts consulting the log
+  // unconditionally.
+  const { env, cwd } = withFakeAgy({ behavior: "quota-retry-ok" });
+  const result = await runTurn(cwd, { prompt: "retry then succeed", env });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.error, null);
+  assert.equal(result.markerFound, true);
+  assert.match(result.finalMessage, /Reviewed: retry then succeed/);
+});
+
 test("runTurn surfaces a failure when agy exits non-zero", async () => {
   const { env, cwd } = withFakeAgy({ behavior: "fail" });
   const result = await runTurn(cwd, { prompt: "boom", env });
@@ -210,6 +300,61 @@ test("runTurn kills a hanging agy process via its own timeout", async () => {
   assert.equal(result.status, 1);
   assert.ok(result.error);
   assert.match(result.error.message, /timeout|terminated/i);
+});
+
+async function waitForPidFile(pidFile, timeoutMs = 8000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const raw = fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8").trim() : "";
+    if (raw) {
+      return Number(raw);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`fake agy never wrote its pid to ${pidFile}`);
+}
+
+test("an external SIGTERM to the companion process also kills the detached agy child (not just the wrapper)", async () => {
+  // Reproduces the real failure mode behind reported "agy timeouts": a caller
+  // that wraps a review/task command in its OWN external timeout (a Bash tool
+  // timeout, a CI step timeout, feature-pipeline's `timeout=600000`) can only
+  // signal the wrapper process it spawned. Before this fix that left the
+  // detached `agy` child (its own process group, per docs/agy-cli.md
+  // "Concurrency") running forever as an orphan — nothing ever timed it out.
+  const pidFile = path.join(makeTempDir("antigravity-agypid-"), "agy.pid");
+  const { env, cwd } = withFakeAgy({ behavior: "hang", pidFile });
+
+  const wrapper = spawn(process.execPath, [SCRIPT, "task", "hang please", "-C", cwd], {
+    env,
+    stdio: "ignore"
+  });
+
+  // Hoisted above the try so the finally block can still reach it. If the
+  // guard under test ever regresses (agy outlives the wrapper), the assertion
+  // below throws and, without this, the fake agy fixture would leak as a
+  // hung process for the rest of the test run instead of being cleaned up.
+  let agyPid = null;
+  try {
+    agyPid = await waitForPidFile(pidFile);
+    assert.ok(isAlive(agyPid), "fake agy should be running before the wrapper is signalled");
+
+    // Simulate an external supervisor killing only the wrapper it spawned — it
+    // has no idea a detached grandchild even exists.
+    wrapper.kill("SIGTERM");
+
+    assert.equal(
+      await waitForDeath(agyPid),
+      true,
+      "the detached agy child must not outlive the wrapper's own death"
+    );
+  } finally {
+    if (isAlive(wrapper.pid)) {
+      wrapper.kill("SIGKILL");
+    }
+    if (agyPid !== null && isAlive(agyPid)) {
+      process.kill(agyPid, "SIGKILL");
+    }
+  }
 });
 
 test("runReview returns the model review text", async () => {
@@ -253,6 +398,24 @@ test("parseStructuredOutput parses fenced JSON and reports parse errors", () => 
   const bad = parseStructuredOutput("not json");
   assert.equal(bad.parsed, null);
   assert.ok(bad.parseError);
+});
+
+test("companion task --json includes the QUOTA_EXHAUSTED error in the payload, not just an empty rawOutput", () => {
+  const { env, cwd } = withFakeAgy({ behavior: "quota-exhausted" });
+
+  const result = run("node", [SCRIPT, "task", "--json", "do the thing"], { cwd, env });
+  // The task failed (quota exhausted), so the wrapper's own exit code is
+  // non-zero — but the JSON payload on stdout must still carry the reason.
+  assert.equal(result.status, 1, result.stdout);
+  const payload = JSON.parse(result.stdout);
+  // Before this fix, `error` was omitted from the task payload entirely: only
+  // {"status":1,"threadId":null,"rawOutput":"","touchedFiles":[],"reasoningSummary":[]}
+  // reached callers like stop-review-gate-hook.mjs, which had nothing usable to
+  // show besides that raw dump.
+  assert.ok(payload.error, `expected payload.error to be present in ${result.stdout}`);
+  assert.equal(payload.error.code, "QUOTA_EXHAUSTED");
+  assert.equal(payload.error.retryable, false);
+  assert.match(payload.error.message, /quota/i);
 });
 
 test("companion setup --json reports ready with a fake agy and Google login", () => {

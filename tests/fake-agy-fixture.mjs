@@ -9,6 +9,9 @@ export const RESULT_END_MARKER = "===ANTIGRAVITY_RESULT_END===";
 /** The conversation id the fake `agy` maps every cwd to. */
 export const FIXTURE_CONVERSATION_ID = "conv-fixture-0001";
 
+/** Reset window the fake `agy` reports in its "quota-exhausted" verbose log. */
+export const QUOTA_RESET_WINDOW = "3h59m59s";
+
 /**
  * Install a fake `agy` binary into `binDir` that imitates the one-shot
  * `agy -p "<prompt>"` headless mode the runner depends on. It is a stateless
@@ -32,6 +35,18 @@ export const FIXTURE_CONVERSATION_ID = "conv-fixture-0001";
  *                        i.e. the documented non-TTY stdout-drop resilience).
  *  - "fail"            : prints to stderr and exits 1.
  *  - "hang"            : sleeps far longer than any test timeout (exercises kill).
+ *  - "quota-exhausted" : reproduces a real observed failure (agy 1.0.16, 2026-07-04):
+ *                        exit 0, empty stdout, NO transcript recorded, but the
+ *                        verbose Go log (written to whatever `--log-file <path>`
+ *                        the runner passed) contains a RESOURCE_EXHAUSTED (429)
+ *                        line with a "Resets in <window>" note.
+ *  - "quota-retry-ok"  : writes the SAME RESOURCE_EXHAUSTED verbose log content
+ *                        as "quota-exhausted" (a transient retry that DID show
+ *                        up in the log), but then completes the turn normally
+ *                        (marker-wrapped reply, transcript, exit 0) instead of
+ *                        exiting early. Exercises the invariant that a log
+ *                        merely MENTIONING RESOURCE_EXHAUSTED must never
+ *                        override a turn that produced real, usable output.
  *
  * Regardless of behaviour, a `--conversation <id>` for an id this fixture never
  * issued reproduces real `agy`'s "bogus id -> ran fresh" path: it warns on
@@ -48,6 +63,7 @@ const VERSION = "1.0.10-fake";
 const BEGIN = ${JSON.stringify(RESULT_BEGIN_MARKER)};
 const END = ${JSON.stringify(RESULT_END_MARKER)};
 const CONVERSATION_ID = ${JSON.stringify(FIXTURE_CONVERSATION_ID)};
+const QUOTA_RESET_WINDOW = ${JSON.stringify(QUOTA_RESET_WINDOW)};
 const behavior = process.env.AGY_FIXTURE_BEHAVIOR || "ok";
 
 const argv = process.argv.slice(2);
@@ -80,6 +96,18 @@ if (prompt == null) {
   process.exit(2);
 }
 
+// Record this process's own pid so tests can assert on its liveness (e.g. that
+// it does or does not survive its parent wrapper dying) without shelling out to
+// \`ps\` to find it. Placed after the early-exit branches above (--version,
+// missing -p) so it reflects the real turn's pid, not a short-lived probe.
+if (process.env.AGY_FIXTURE_PID_FILE) {
+  try {
+    fs.writeFileSync(process.env.AGY_FIXTURE_PID_FILE, String(process.pid));
+  } catch {
+    // best effort
+  }
+}
+
 if (behavior === "hang") {
   // Sleep effectively forever; the runner must kill us via its own timeout.
   setInterval(() => {}, 1000);
@@ -89,6 +117,46 @@ if (behavior === "hang") {
 if (behavior === "fail") {
   process.stderr.write("fake agy failure\\n");
   process.exit(1);
+}
+
+// Shared by "quota-exhausted" and "quota-retry-ok": writes the same verbose-log
+// RESOURCE_EXHAUSTED content either behaviour reproduces. Factored out so the
+// two behaviours cannot silently drift apart.
+function writeQuotaLog(logFile) {
+  if (!logFile) {
+    return;
+  }
+  try {
+    fs.mkdirSync(path.dirname(logFile), { recursive: true });
+    fs.writeFileSync(
+      logFile,
+      "I0704 21:25:29.498251 44290 model_config_manager.go:157] Propagating selected model override to backend\\n" +
+        "I0704 21:25:30.244011 44290 log_context.go:117] Encountered retryable api error. retrying in 1.83845231s. Error (The model API is currently overloaded and may experience intermittent errors.): RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in " +
+        QUOTA_RESET_WINDOW +
+        ".\\n" +
+        "E0704 21:25:32.482309 44290 log.go:398] agent executor error: model unreachable: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in " +
+        QUOTA_RESET_WINDOW +
+        ".\\n"
+    );
+  } catch {
+    // best effort, mirrors the other behaviours' best-effort file writes
+  }
+}
+
+if (behavior === "quota-exhausted") {
+  writeQuotaLog(flagValue("--log-file"));
+  // Real agy: exits 0 with nothing on stdout and no transcript once every retry
+  // inside the turn hits RESOURCE_EXHAUSTED — the failure lives ONLY in the
+  // verbose log, never on stdout/stderr/exit-code.
+  process.exit(0);
+}
+
+if (behavior === "quota-retry-ok") {
+  // Same verbose-log content as "quota-exhausted", but deliberately does NOT
+  // exit here: falls through to the normal success path below (marker reply +
+  // transcript), reproducing a turn where a retry logged RESOURCE_EXHAUSTED but
+  // still went on to succeed.
+  writeQuotaLog(flagValue("--log-file"));
 }
 
 const home = process.env.HOME || os.homedir();
@@ -156,6 +224,8 @@ process.exit(0);
  * `~/.gemini`). `googleAccount: true` writes a fake `google_accounts.json` so
  * the auth probe reports a Google login. `argvLog` points the fixture at a file
  * where it appends each invocation's argv (for resume-path assertions).
+ * `pidFile` points the fixture at a file where it writes its own pid (for
+ * liveness/orphan assertions).
  */
 export function buildEnv(binDir, options = {}) {
   const fakeHome = options.home ?? makeTempDir("antigravity-home-");
@@ -176,6 +246,10 @@ export function buildEnv(binDir, options = {}) {
 
   if (options.argvLog) {
     env.AGY_FIXTURE_ARGV_LOG = options.argvLog;
+  }
+
+  if (options.pidFile) {
+    env.AGY_FIXTURE_PID_FILE = options.pidFile;
   }
 
   return env;
