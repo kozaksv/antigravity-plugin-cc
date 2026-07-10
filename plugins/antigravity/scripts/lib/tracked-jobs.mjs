@@ -183,6 +183,12 @@ export async function runTrackedJob(job, runner, options = {}) {
   try {
     const execution = await runner({ recordAgyPid, recordSnapshot });
     const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    // A clean completion has no half-applied patch to roll back, so the
+    // snapshot is consumed. A FAILED turn (e.g. the runner timeout killed a
+    // write turn mid-edit) can leave partial edits in the tree — nulling the
+    // snapshot there would destroy the only rollback metadata the user has
+    // (review-escalation P1), so it is preserved on the record instead.
+    const keptSnapshot = completionStatus === "completed" ? null : runningRecord.workspaceSnapshot ?? null;
     const completedAt = nowIso();
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
@@ -191,8 +197,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       pid: null,
       agyPid: null,
-      // Turn finished on its own; no half-applied patch to roll back.
-      workspaceSnapshot: null,
+      workspaceSnapshot: keptSnapshot,
       phase: completionStatus === "completed" ? "done" : "failed",
       completedAt,
       result: execution.payload,
@@ -207,14 +212,28 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: completionStatus === "completed" ? "done" : "failed",
       pid: null,
       agyPid: null,
+      // Keep the index row consistent with the job file: recordSnapshot upserts
+      // the snapshot into the index, so completion must clear (or carry) it
+      // explicitly — a patch-merge would otherwise retain it forever.
+      workspaceSnapshot: keptSnapshot,
       completedAt
     });
+    if (keptSnapshot) {
+      appendLogLine(
+        options.logFile ?? job.logFile ?? null,
+        `Turn failed with a pre-run snapshot on record; the turn may have left partial edits (rollback head ${keptSnapshot.head ?? "unknown"}).`
+      );
+    }
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
+    // Same preservation rule as the failed-completion path above: the error may
+    // have interrupted a write turn after `agy` already touched files, so the
+    // rollback metadata must survive on the failed record.
+    const keptSnapshot = existing.workspaceSnapshot ?? runningRecord.workspaceSnapshot ?? null;
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
@@ -222,9 +241,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       pid: null,
       agyPid: null,
-      // Turn errored on its own (not a mid-turn kill); leave the working tree
-      // as-is and drop the rollback snapshot.
-      workspaceSnapshot: null,
+      workspaceSnapshot: keptSnapshot,
       completedAt,
       logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
     });
@@ -234,6 +251,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       phase: "failed",
       pid: null,
       agyPid: null,
+      workspaceSnapshot: keptSnapshot,
       errorMessage,
       completedAt
     });
