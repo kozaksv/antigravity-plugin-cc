@@ -6,7 +6,7 @@ This plugin is for Claude Code users who want an easy way to start using Google'
 
 ## What You Get
 
-- `/antigravity:review` for a normal read-only Antigravity review
+- `/antigravity:review` for a normal read-only (sandboxed) Antigravity review
 - `/antigravity:adversarial-review` for a steerable challenge review
 - `/antigravity:rescue`, `/antigravity:status`, `/antigravity:result`, and `/antigravity:cancel` to delegate work and manage background jobs
 
@@ -94,7 +94,7 @@ Examples:
 /antigravity:review --background
 ```
 
-This command is read-only and will not perform any changes. When run in the background you can use [`/antigravity:status`](#antigravitystatus) to check on the progress and [`/antigravity:cancel`](#antigravitycancel) to cancel the ongoing task.
+This command is read-only by contract: it runs `agy` under `--sandbox` terminal restrictions and instructs it not to modify files (see [Security posture](#security-posture)). When run in the background you can use [`/antigravity:status`](#antigravitystatus) to check on the progress and [`/antigravity:cancel`](#antigravitycancel) to cancel the ongoing task.
 
 ### `/antigravity:adversarial-review`
 
@@ -118,7 +118,7 @@ Examples:
 /antigravity:adversarial-review --background look for race conditions and question the chosen approach
 ```
 
-This command is read-only. It does not fix code.
+This command is read-only by the same contract as `/antigravity:review` (see [Security posture](#security-posture)). It does not fix code.
 
 ### `/antigravity:rescue`
 
@@ -157,7 +157,7 @@ Ask Antigravity to redesign the database connection to be more resilient.
 
 - if you do not pass `--model`, Antigravity uses its own default (`Gemini 3.5 Flash (Medium)`).
 - if you say `spark`, the plugin maps that to the Antigravity lite model `Gemini 3.5 Flash (Low)`
-- follow-up rescue requests can continue the latest Antigravity conversation in the repo
+- follow-up rescue requests can continue the latest Antigravity conversation from the current Claude session (job records are session-scoped and are cleaned up when the session ends)
 
 ### `/antigravity:status`
 
@@ -273,6 +273,8 @@ Pass a label verbatim with `--model`, or use one of the plugin's short aliases: 
 
 There is no `~/.codex/config.toml` equivalent and no `~/.antigravity/` directory — everything is under `~/.gemini/`.
 
+The plugin's own job and state records — queued/running/finished job metadata, prompts, results, and the review-gate toggle — are separate from `agy`'s state above. They live under `$CLAUDE_PLUGIN_DATA/state` when Claude Code sets that variable, otherwise `$XDG_STATE_HOME/antigravity-companion`, otherwise `~/.local/state/antigravity-companion` (directories are created owner-only, `0700`). Before 1.0.2 this state lived in the system temp directory, where it could be pruned by the OS.
+
 ### Resuming a conversation in Antigravity
 
 Delegated tasks and any [stop gate](#enabling-review-gate) run can be resumed directly with the `agy` CLI:
@@ -281,6 +283,19 @@ Delegated tasks and any [stop gate](#enabling-review-gate) run can be resumed di
 - `agy --conversation <id> -p "<follow-up>"` resumes a specific conversation by the ID shown in `/antigravity:result` or `/antigravity:status`.
 
 This way you can review the Antigravity work or continue it directly in the CLI.
+
+## Security posture
+
+- **Headless runs skip `agy`'s permission prompts.** Every turn passes `--dangerously-skip-permissions` to `agy`. Without it, a non-interactive `agy -p` run stalls forever on its first tool-permission prompt — there is no TTY to answer it from. This is inherent to headless operation, not an oversight.
+- **Non-write runs are sandboxed, but that's defense-in-depth, not a proven boundary.** `/antigravity:review`, `/antigravity:adversarial-review`, and `/antigravity:rescue` tasks run without `--write` additionally pass `agy`'s own `--sandbox` flag (terminal restrictions). Treat "read-only" as a contract enforced by prompt instructions plus the sandbox flag, not as a hard guarantee.
+- **Escape hatch:** set `ANTIGRAVITY_COMPANION_NO_SANDBOX=1` to disable the `--sandbox` flag, for environments where it interferes with a review's read-only git inspection.
+- **Write-capable tasks are not sandboxed at all.** `--write` (the default for `/antigravity:rescue`) runs `agy` with no `--sandbox` restriction — it edits your working tree and runs commands directly.
+- **Reviewed diffs and task prompts are untrusted model input.** A malicious diff can attempt prompt injection against the reviewer. For write tasks, the pre-run git snapshot, rollback, and [`/antigravity:cancel`](#antigravitycancel) limit the blast radius, but review the results before trusting them.
+- **Minimum tested `agy` version: 1.0.10.** Earlier versions have not been validated against this plugin's argv assembly and output parsing.
+
+## Supported platforms
+
+macOS and Linux (POSIX) are supported and tested. Windows is untested and unsupported: the process-tree kill and detached-spawn machinery in this plugin is POSIX-focused, and `.cmd` shims are not spawned through a shell there. Contributions welcome.
 
 ## Caveats
 
