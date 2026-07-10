@@ -81,7 +81,11 @@ export function splitRawArgumentString(raw) {
 
   for (const character of raw) {
     if (escaping) {
-      current += character;
+      if (/\s/.test(character) || character === "'" || character === "\"" || character === "\\") {
+        current += character;
+      } else {
+        current += "\\" + character;
+      }
       escaping = false;
       continue;
     }
