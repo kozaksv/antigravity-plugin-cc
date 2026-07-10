@@ -41,8 +41,10 @@ State & concurrency:
   when a target process cannot be confirmed stopped it refuses to roll back the
   workspace or write a terminal `cancelled` status (which would corrupt a live
   writer's tree and hide a running job), reporting the cancel as incomplete
-  instead; and when the worker already committed a terminal status first, the
-  CAS rejection is surfaced rather than reported as a clean cancellation.
+  instead. It also re-reads the canonical status after the confirmed kill and
+  BEFORE any rollback: a job that finished on its own in the meantime keeps its
+  completed output (no rollback, reported truthfully) rather than having it
+  erased while cancel claims there was nothing to cancel.
 - The file lock creates its file with the payload already written (temp file +
   atomic `link`), so the canonical lock is never observed empty — closing a
   TOCTOU where a creator stalled past the empty-grace window could have its
@@ -51,8 +53,10 @@ State & concurrency:
   longer times out spuriously.
 - The legacy-state migration treats only ENOENT as "no legacy state"; an
   unreadable (EACCES/EIO) legacy file that actually exists is warned about and
-  retried on the next access rather than being taken as a fresh workspace,
-  which would have stranded an enabled stop-review gate.
+  retried on the next access rather than being taken as a fresh workspace. A
+  state WRITE attempted during such an outage is refused (rather than creating a
+  fresh new-root state file that would permanently mask — and thereby disable —
+  an enabled stop-review gate).
 - A FAILED write turn (e.g. runner timeout mid-edit) preserves its pre-run
   workspace snapshot on the job record for rollback instead of destroying it.
 

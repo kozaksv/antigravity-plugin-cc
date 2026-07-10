@@ -1091,14 +1091,39 @@ async function handleCancel(argv) {
     return;
   }
 
+  appendLogLine(job.logFile, "Cancel requested.");
+
+  // Every kill target is confirmed stopped, so the CANONICAL job status is now
+  // settled — a dead worker cannot write again. Re-read it BEFORE touching the
+  // workspace: if the job actually FINISHED on its own (terminal) in the window
+  // between selection and this kill, its tracked edits are legitimate output,
+  // and rolling back the pre-run snapshot would ERASE completed work while
+  // falsely reporting "nothing to cancel" (review escalation P1). Only a job
+  // that is still non-terminal here is genuinely being cancelled mid-flight.
+  const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
+  const canonical = readStoredJob(workspaceRoot, job.id) ?? existing;
+  if (terminalStatuses.has(canonical.status)) {
+    const message = `Job ${job.id} already ${canonical.status} before it could be cancelled; nothing to cancel (workspace left untouched).`;
+    appendLogLine(job.logFile, message);
+    // Reconcile the index with the canonical status; leave the job file and the
+    // workspace exactly as the finished worker left them.
+    upsertJob(workspaceRoot, { id: job.id, status: canonical.status, pid: null, agyPid: null, workspaceSnapshot: null });
+    outputCommandResult(
+      { jobId: job.id, status: canonical.status, cancelled: false, note: message },
+      `${message}\n`,
+      options.json
+    );
+    return;
+  }
+
   appendLogLine(job.logFile, "Cancelled by user.");
 
   // Write tasks run `agy`'s black-box edits directly in the workspace, so a
-  // mid-turn kill can leave a half-applied patch. Roll the working tree back to
-  // the snapshot captured before the turn (which preserves the user's pre-run
-  // changes and only drops the turn's edits). Best effort: never let cleanup
-  // failure block the cancel itself. Safe now: every target is confirmed
-  // stopped (or was already gone), so no live writer races the reset.
+  // mid-turn kill can leave a half-applied patch. The job is confirmed stopped
+  // AND non-terminal (it did NOT complete), so its edits are an incomplete
+  // cancelled turn: roll the working tree back to the pre-task snapshot (which
+  // preserves the user's pre-run changes and only drops the turn's edits).
+  // Best effort: never let cleanup failure block the cancel itself.
   const snapshot = existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
   let rollback = null;
   if (snapshot) {
@@ -1127,10 +1152,11 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  // `writeJobFile`'s CAS rejects the `cancelled` write when the worker already
-  // committed a terminal status (e.g. it finished `completed` in the window
-  // between job selection and this write). Do not then report a clean cancel:
-  // surface the status that actually won on disk (review escalation P2).
+  // Defensive guard: canonical was non-terminal a moment ago and the worker is
+  // dead, so this CAS normally applies. If it somehow did not, never claim a
+  // clean cancel — surface the status that actually won on disk. (Reaching here
+  // still means the job was non-terminal at the pre-rollback check, so the
+  // rollback above dropped an incomplete turn's edits, not completed output.)
   const write = writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
@@ -1141,12 +1167,11 @@ async function handleCancel(argv) {
 
   if (!write.applied) {
     const finalStatus = write.canonicalStatus ?? "finished";
-    const message = `Job ${job.id} already ${finalStatus} before it could be cancelled; nothing to cancel.`;
+    const message = `Job ${job.id} reached ${finalStatus} before the cancel could be recorded; reporting the canonical status.`;
     appendLogLine(job.logFile, message);
-    // Reconcile the index with the canonical terminal status the worker wrote.
     upsertJob(workspaceRoot, { id: job.id, status: finalStatus, pid: null, agyPid: null, workspaceSnapshot: null });
     outputCommandResult(
-      { jobId: job.id, status: finalStatus, cancelled: false, note: message },
+      { jobId: job.id, status: finalStatus, cancelled: false, note: message, workspaceRollback: rollback },
       `${message}\n`,
       options.json
     );

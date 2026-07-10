@@ -368,7 +368,41 @@ function removeFileWithinIfExists(allowedDir, filePath) {
  * section without the O_EXCL lock (which is not reentrant) ever nesting
  * inside itself.
  */
+/**
+ * Guard against the one write that could permanently strand a legacy config:
+ * creating the NEW-root state.json for the FIRST time while a legacy state file
+ * still EXISTS but could not be read (EACCES/EIO). If that write proceeded,
+ * every future migration check would see the fresh file and skip the legacy
+ * config forever — silently disabling an enabled stop-review gate even though
+ * `migrateLegacyConfigIfNeeded` deliberately left it unmarked for retry
+ * (review escalation P2). A readable legacy file is fine (its config was
+ * already carried in), and an absent one (ENOENT) has nothing to strand. This
+ * is a lock-free read; it runs inside the already-held state lock via
+ * `saveStateUnlocked` without re-entering it.
+ */
+function assertLegacyMigrationNotStranded(cwd) {
+  const stateFile = resolveStateFile(cwd);
+  const legacyFile = resolveLegacyStateFile(cwd);
+  if (stateFile === legacyFile || fs.existsSync(stateFile)) {
+    return; // new state already exists (or we ARE the legacy root): no masking risk
+  }
+  try {
+    fs.readFileSync(legacyFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return; // no legacy state to strand
+    }
+    throw new Error(
+      `Refusing to initialize state at ${stateFile} while the legacy config at ${legacyFile} is unreadable ` +
+        `(${error?.code ?? (error instanceof Error ? error.message : String(error))}); a fresh write would ` +
+        "permanently mask it and could disable an enabled stop-review gate. " +
+        "Resolve the permission/IO error or remove the legacy file."
+    );
+  }
+}
+
 function saveStateUnlocked(cwd, state) {
+  assertLegacyMigrationNotStranded(cwd);
   const previousJobs = loadStateUnlocked(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);

@@ -20,6 +20,7 @@ import {
   resolveStateDir,
   resolveStateFile,
   saveState,
+  setConfig,
   updateState,
   upsertJob,
   writeJobFile
@@ -686,5 +687,64 @@ test("acquireFileLockSync still mutually excludes a live holder after the link-t
     () => acquireFileLockSync(lockPath, { timeoutMs: 250, pollMs: 50 }),
     /Timed out waiting for file lock/
   );
+  held.release();
+});
+
+// --- migration: a write during an unreadable-legacy outage must NOT strand the gate ---
+
+test("a state WRITE while the legacy file is unreadable is refused, not allowed to mask the gate", () => {
+  const workspace = makeTempDir();
+  const legacyDir = seedLegacyState(
+    workspace,
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] })}\n`
+  );
+  const legacyFile = path.join(legacyDir, "state.json");
+
+  fs.chmodSync(legacyFile, 0o000);
+  let deniedRead = false;
+  try {
+    fs.readFileSync(legacyFile, "utf8");
+  } catch (error) {
+    deniedRead = error?.code === "EACCES" || error?.code === "EPERM";
+  }
+
+  try {
+    if (!deniedRead) {
+      return; // environment cannot simulate the read failure (e.g. root); skip
+    }
+
+    // A write (setConfig/upsertJob) while migration cannot read the legacy file
+    // must THROW rather than create a fresh new-root state.json — that fresh
+    // file would permanently mask the enabled gate on every later check
+    // (review escalation P2).
+    assert.throws(() => setConfig(workspace, "someKey", true), /unreadable|Refusing to initialize state/i);
+    assert.equal(fs.existsSync(resolveStateFile(workspace)), false, "no fresh state may be written over a pending migration");
+
+    // Once the legacy file is readable again, the write succeeds and the gate migrates.
+    fs.chmodSync(legacyFile, 0o600);
+    setConfig(workspace, "someKey", true);
+    assert.equal(getConfig(workspace).stopReviewGate, true, "the enabled gate must survive the recovered migration");
+  } finally {
+    fs.chmodSync(legacyFile, 0o600);
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+  }
+});
+
+// --- file-lock: the private .mk temp is never leaked ---
+
+test("acquireFileLockSync leaves no .mk temp files when a contended acquire fails to link", () => {
+  const dir = makeTempDir();
+  const lockPath = path.join(dir, "x.lock");
+  const held = acquireFileLockSync(lockPath, { pid: process.pid });
+
+  // A second acquire against the live holder repeatedly hits the link-EEXIST
+  // path and must clean up its temp file on every attempt.
+  assert.throws(
+    () => acquireFileLockSync(lockPath, { timeoutMs: 300, pollMs: 40 }),
+    /Timed out waiting for file lock/
+  );
+
+  const leaked = fs.readdirSync(dir).filter((name) => name.includes(".mk"));
+  assert.deepEqual(leaked, [], `no .mk temp files may leak, found: ${leaked.join(", ")}`);
   held.release();
 });

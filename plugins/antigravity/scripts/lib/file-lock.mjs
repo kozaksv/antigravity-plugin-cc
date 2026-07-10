@@ -387,28 +387,33 @@ function tryCreateLock(lockPath, pid, token) {
     }
     throw error;
   }
+  // ONE outer finally covers the whole post-open sequence, so the private `.mk`
+  // temp is ALWAYS cleaned up — on a write/close failure (ENOSPC, EIO), on a
+  // link EEXIST, on link success, or on any other throw. Without this a failed
+  // payload write would leak a temp file per attempt and, under a repeatedly
+  // failing state operation, accumulate them toward inode/disk exhaustion.
   try {
-    fs.writeSync(fd, JSON.stringify({ pid, token, createdAt: new Date().toISOString() }));
-  } finally {
-    fs.closeSync(fd);
-  }
-  try {
-    fs.linkSync(tmpPath, lockPath); // atomic publish; EEXIST => already held
-  } catch (error) {
-    if (error?.code === "EEXIST") {
-      return false;
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid, token, createdAt: new Date().toISOString() }));
+    } finally {
+      fs.closeSync(fd);
     }
-    throw error;
+    try {
+      fs.linkSync(tmpPath, lockPath); // atomic publish; EEXIST => already held
+      return true;
+    } catch (error) {
+      if (error?.code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
   } finally {
-    // The link (success or EEXIST) left our temp copy behind; drop it so only
-    // the canonical name — or nothing — remains.
     try {
       fs.unlinkSync(tmpPath);
     } catch {
       // best effort
     }
   }
-  return true;
 }
 
 function makeLockHandle(lockPath, token) {
