@@ -38,10 +38,17 @@ import process from "node:process";
 
 const LOCK_POLL_MS = 50;
 const DEFAULT_ACQUIRE_TIMEOUT_MS = 5000;
-/** Empty/unparseable lock younger than this: assume mid-create, wait, never reclaim. */
+/**
+ * Empty/unparseable lock younger than this: assume mid-create, wait, never
+ * reclaim. PAST this grace an empty lock can only be a creator that died (or
+ * failed) between `open(wx)` and its payload write — there is no pid to probe,
+ * so it is reclaimed IMMEDIATELY. This threshold must stay well below
+ * DEFAULT_ACQUIRE_TIMEOUT_MS: an earlier design kept empty locks in a
+ * "not fresh but not yet stale" dead zone (2s..10s) longer than the acquire
+ * timeout (5s), so every waiter timed out before the crashed creator's lock
+ * ever became reclaimable — a self-sustaining wedge (review escalation P1).
+ */
 const DEFAULT_EMPTY_GRACE_MS = 2000;
-/** Lock (with a known pid) or an empty lock older than this is reclaim-eligible. */
-const DEFAULT_STALE_MS = 10_000;
 /** A wedged reaper lock (its owner crashed) older than this is force-cleared. */
 const REAP_LOCK_STALE_MS = 15_000;
 
@@ -206,6 +213,14 @@ function acquireReapLock(reapLockPath, killImpl) {
     const token = makeToken(process.pid);
     try {
       fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }));
+    } catch (error) {
+      // Same ENOSPC hazard as tryCreateLock: never leave an empty reaper behind.
+      try {
+        fs.unlinkSync(reapLockPath);
+      } catch {
+        // best effort
+      }
+      throw error;
     } finally {
       fs.closeSync(fd);
     }
@@ -321,19 +336,18 @@ export function reclaimStaleEntry(entryPath, { isStale, killImpl = process.kill.
   }
 }
 
-function isLockStale(raw, stat, { killImpl, emptyGraceMs, staleAfterMs }) {
+function isLockStale(raw, stat, { killImpl, emptyGraceMs }) {
   const parsed = parsePayload(raw);
-  const ageMs = Date.now() - stat.mtimeMs;
   if (parsed && Number.isFinite(Number(parsed.pid))) {
     // A known, dead pid is a strong/deterministic signal: reclaim immediately.
     return !pidIsAlive(Number(parsed.pid), killImpl);
   }
-  // Empty/unparseable: we cannot check pid liveness, so fall back to a pure
-  // age threshold. Below the grace window it is presumed mid-create.
-  if (ageMs < emptyGraceMs) {
-    return false;
-  }
-  return ageMs >= staleAfterMs;
+  // Empty/unparseable: no pid to probe. Within the grace window it is presumed
+  // a live peer mid-create; past it the creator is dead (crashed/failed between
+  // open and payload write) and the lock is reclaimed right away — any longer
+  // threshold here must never exceed the acquire timeout, or waiters would all
+  // time out before the lock ever becomes reclaimable.
+  return Date.now() - stat.mtimeMs >= emptyGraceMs;
 }
 
 function tryCreateLock(lockPath, pid, token) {
@@ -348,6 +362,16 @@ function tryCreateLock(lockPath, pid, token) {
   }
   try {
     fs.writeSync(fd, JSON.stringify({ pid, token, createdAt: new Date().toISOString() }));
+  } catch (error) {
+    // Payload write failed (e.g. ENOSPC): without cleanup this leaves an empty
+    // lock that blocks every peer for the whole empty-grace window even though
+    // no one holds it. Best-effort unlink, then surface the original error.
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // best effort
+    }
+    throw error;
   } finally {
     fs.closeSync(fd);
   }
@@ -391,7 +415,6 @@ export function acquireFileLockSync(lockPath, options = {}) {
   const timeoutMs = Number.isFinite(options.timeoutMs) ? options.timeoutMs : DEFAULT_ACQUIRE_TIMEOUT_MS;
   const killImpl = options.killImpl ?? process.kill.bind(process);
   const emptyGraceMs = Number.isFinite(options.emptyGraceMs) ? options.emptyGraceMs : DEFAULT_EMPTY_GRACE_MS;
-  const staleAfterMs = Number.isFinite(options.staleAfterMs) ? options.staleAfterMs : DEFAULT_STALE_MS;
 
   fs.mkdirSync(path.dirname(lockPath), { recursive: true });
 
@@ -414,9 +437,9 @@ export function acquireFileLockSync(lockPath, options = {}) {
       continue;
     }
 
-    if (isLockStale(info.raw, info.stat, { killImpl, emptyGraceMs, staleAfterMs })) {
+    if (isLockStale(info.raw, info.stat, { killImpl, emptyGraceMs })) {
       const outcome = reclaimStaleEntry(lockPath, {
-        isStale: (raw, stat) => isLockStale(raw, stat, { killImpl, emptyGraceMs, staleAfterMs }),
+        isStale: (raw, stat) => isLockStale(raw, stat, { killImpl, emptyGraceMs }),
         killImpl
       });
       // Only a successful reclaim (or an entry that vanished) actually frees the

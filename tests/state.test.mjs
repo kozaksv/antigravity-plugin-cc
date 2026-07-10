@@ -450,14 +450,33 @@ test("acquireFileLockSync does not reclaim an empty/undecided lock younger than 
     const handle = acquireFileLockSync(lockPath, {
       timeoutMs: 3000,
       pollMs: 50,
-      emptyGraceMs: 2000,
-      staleAfterMs: 10_000
+      emptyGraceMs: 2000
     });
     assert.ok(handle, "must eventually acquire after the peer's empty lock clears, not by reclaiming it early");
     handle.release();
   } finally {
     await remover.terminate();
   }
+});
+
+test("acquireFileLockSync reclaims an empty lock past the grace window WITHIN the default acquire timeout (no wedge)", () => {
+  const dir = makeTempDir();
+  const lockPath = path.join(dir, "x.lock");
+  // A creator that crashed between open(wx) and its payload write: empty file,
+  // already older than the grace window (backdate mtime by 5s).
+  fs.writeFileSync(lockPath, "");
+  const past = new Date(Date.now() - 5000);
+  fs.utimesSync(lockPath, past, past);
+
+  // Regression (review escalation P1): with the old "empty is stale only after
+  // 10s" dead zone, every waiter with the default 5s timeout starved here.
+  const started = Date.now();
+  const handle = acquireFileLockSync(lockPath, { pollMs: 25, emptyGraceMs: 2000 });
+  const waitedMs = Date.now() - started;
+  assert.ok(handle, "expected the crashed creator's empty lock to be reclaimed");
+  assert.ok(waitedMs < 4000, `reclaim must beat the default acquire timeout, took ${waitedMs}ms`);
+  handle.release();
+  assert.equal(fs.existsSync(lockPath), false);
 });
 
 test("reclaimStaleEntry: concurrent reclaimers racing the same stale entry — exactly one reclaims", async () => {
