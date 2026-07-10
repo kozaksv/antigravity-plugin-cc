@@ -254,25 +254,6 @@ function buildAdversarialReviewPrompt(context, focusText) {
   });
 }
 
-/** Build the (single, bounded) repair-turn prompt: validator errors + a
- * reminder of the contract, deliberately NOT re-sending the full review
- * context — the repair turn resumes the SAME conversation (see
- * `runAdversarialReviewTurn`), so the model already has the diff in front of
- * it and only needs to fix the JSON shape. */
-function buildReviewRepairPrompt(errors) {
-  return [
-    "Your previous reply did not validate against the required JSON Schema for this review.",
-    "Fix ONLY the JSON so it satisfies every field, enum, and numeric bound in that schema, and resend it.",
-    "Do not change your findings or verdict for any reason other than making the output schema-valid.",
-    "",
-    "Validation errors:",
-    ...errors.map((error) => `- ${error}`),
-    "",
-    "Output ONLY the corrected JSON, wrapped between the result markers exactly as instructed before:",
-    "begin your reply with the exact line `===ANTIGRAVITY_RESULT_BEGIN===`, then the JSON object, then the exact line `===ANTIGRAVITY_RESULT_END===`."
-  ].join("\n");
-}
-
 /**
  * Validate a parsed review turn's output against the review-output schema.
  * A turn that itself failed (non-zero status, or JSON that did not even
@@ -290,24 +271,24 @@ function validateReviewTurnOutput(turnResult, parsed) {
 
 /**
  * Run the adversarial-review turn with fail-closed structured-output
- * validation and a single bounded repair attempt.
+ * validation.
  *
  * Fail-closed contract: any output that does not fully validate against
  * `schemas/review-output.schema.json` is treated as a review ERROR, never as
- * a silent success/approve — including after a failed repair attempt.
+ * a silent success/approve.
  *
- * Bounded repair: at most ONE additional turn is spent asking the model to
- * fix a schema-invalid reply. That repair turn MUST resume the exact same
- * conversation as the initial turn (via `resumeThreadId`), because a fresh
- * conversation would have no diff context and could "fix" the JSON shape by
- * fabricating an unfounded `approve` — turning fail-closed into a silent
- * false approval. If the initial turn produced no conversation id to resume,
- * repair is skipped entirely (fail-closed, not a blind retry in a fresh
- * conversation).
+ * Deliberately NO automatic repair turn: a repair would have to resume the
+ * original conversation, but the conversation id comes from agy's shared
+ * cwd -> conversation cache (`last_conversations.json`), which a concurrent
+ * same-repo turn can repoint between the two calls. A repair landing in the
+ * wrong conversation could return a schema-valid but ungrounded `approve`,
+ * silently defeating the fail-closed contract (review escalation, 2026-07-10).
+ * Rerunning the review command is the safe retry.
  */
 async function runAdversarialReviewTurn(context, focusText, request) {
   const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const turnOptions = {
+  const result = await runTurn(context.repoRoot, {
+    prompt,
     model: request.model,
     // Read-only review turn: run under agy's own `--sandbox` terminal
     // restrictions (see buildAgyArgs; ANTIGRAVITY_COMPANION_NO_SANDBOX=1 opts out).
@@ -317,81 +298,12 @@ async function runAdversarialReviewTurn(context, focusText, request) {
     skipPermissions: true,
     onProgress: request.onProgress,
     onSpawn: request.onAgyPid
-  };
-
-  const first = await runTurn(context.repoRoot, { prompt, ...turnOptions });
-  const firstParsed = parseStructuredOutput(first.finalMessage, {
-    status: first.status,
-    failureMessage: first.error?.message ?? first.stderr
   });
-  const firstValidation = validateReviewTurnOutput(first, firstParsed);
-
-  if (firstValidation.valid) {
-    return { result: first, parsed: firstParsed, validation: firstValidation, repairAttempted: false, repaired: false };
-  }
-
-  // Only worth repairing if the turn itself came back (status 0) with *some*
-  // final message to fix — a hard turn failure (error/timeout) has nothing to
-  // repair.
-  if (first.status !== 0) {
-    return { result: first, parsed: firstParsed, validation: firstValidation, repairAttempted: false, repaired: false };
-  }
-
-  if (!first.threadId) {
-    return {
-      result: first,
-      parsed: firstParsed,
-      validation: {
-        valid: false,
-        errors: [
-          ...firstValidation.errors,
-          "Repair turn skipped: no conversation id was available to resume, so a blind retry in a fresh conversation (without diff context) was refused (fail-closed)."
-        ]
-      },
-      // No repair turn was actually spent (there was nothing safe to resume);
-      // `repairAttempted:false` reflects that no additional `agy` call happened.
-      repairAttempted: false,
-      repaired: false,
-      blockedNoThread: true
-    };
-  }
-
-  const repairPrompt = buildReviewRepairPrompt(firstValidation.errors);
-  const repairResult = await runTurn(context.repoRoot, {
-    prompt: repairPrompt,
-    resumeThreadId: first.threadId,
-    ...turnOptions
+  const parsed = parseStructuredOutput(result.finalMessage, {
+    status: result.status,
+    failureMessage: result.error?.message ?? result.stderr
   });
-  const repairParsed = parseStructuredOutput(repairResult.finalMessage, {
-    status: repairResult.status,
-    failureMessage: repairResult.error?.message ?? repairResult.stderr
-  });
-  let repairValidation = validateReviewTurnOutput(repairResult, repairParsed);
-
-  // Fail-closed guard: `agy` could not resume the original conversation (a bogus
-  // `--conversation <id>` prints a warning and then runs FRESH at exit 0). The
-  // repair prompt deliberately omits the diff (it assumes the same conversation
-  // still has it), so a fresh turn has no grounding and could "fix" the JSON by
-  // fabricating an unfounded `approve`. `runOneShot` surfaces this as
-  // `resumedFresh`; treat it as a hard repair failure regardless of schema
-  // validity — never a silent success.
-  if (repairResult.resumedFresh) {
-    repairValidation = {
-      valid: false,
-      errors: [
-        ...(repairValidation.errors ?? []),
-        "Repair turn failed: `agy` could not resume the original review conversation and ran as a fresh conversation without the diff context, so its output cannot be trusted (fail-closed)."
-      ]
-    };
-  }
-
-  return {
-    result: repairResult,
-    parsed: repairParsed,
-    validation: repairValidation,
-    repairAttempted: true,
-    repaired: repairValidation.valid
-  };
+  return { result, parsed, validation: validateReviewTurnOutput(result, parsed) };
 }
 
 function buildNativeReviewPrompt(context) {
@@ -554,14 +466,14 @@ async function executeReviewRun(request) {
 
   const context = collectReviewContext(request.cwd, target);
   const outcome = await runAdversarialReviewTurn(context, focusText, request);
-  const { result, parsed, validation, repairAttempted, repaired } = outcome;
+  const { result, parsed, validation } = outcome;
   const validationFailed = !validation.valid;
 
   // Fail-closed: an output that does not fully validate against the review
-  // schema (even after the single bounded repair attempt) is NEVER surfaced
-  // as `parsed`/a success — it is folded into a parse-error-shaped result so
-  // both the JSON payload and the rendered text read as an explicit review
-  // error, not a silent (and possibly unfounded) approve.
+  // schema is NEVER surfaced as `parsed`/a success — it is folded into a
+  // parse-error-shaped result so both the JSON payload and the rendered text
+  // read as an explicit review error, not a silent (and possibly unfounded)
+  // approve.
   const effectiveParsed = validationFailed
     ? {
         ...parsed,
@@ -589,8 +501,6 @@ async function executeReviewRun(request) {
     rawOutput: parsed.rawOutput,
     parseError: effectiveParsed.parseError,
     validationErrors: validationFailed ? validation.errors : [],
-    repairAttempted,
-    repaired,
     reasoningSummary: result.reasoningSummary
   };
 

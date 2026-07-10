@@ -752,7 +752,11 @@ test("companion setup --json reports needs-attention when agy is missing", () =>
   assert.match(report.nextSteps.join("\n"), /install\.sh/);
 });
 
-// --- A1: adversarial-review structured-output contract, validation, and bounded repair ---
+// --- A1: adversarial-review structured-output contract and fail-closed validation ---
+// Deliberately NO automatic repair turn: resuming "the same" conversation goes
+// through agy's shared cwd -> conversation cache, which a concurrent same-repo
+// turn can repoint, so a repair could land in a foreign conversation and
+// return a schema-valid but ungrounded approve (review escalation, 2026-07-10).
 
 const VALID_REVIEW_JSON = JSON.stringify({
   verdict: "approve",
@@ -794,10 +798,29 @@ test("adversarial-review embeds the serialized review-output schema in the promp
   assert.match(initialPrompt, /"additionalProperties":\s*false/);
 });
 
-test("adversarial-review is fail-closed: schema-invalid output (twice) becomes an explicit review error, not success", () => {
+test("adversarial-review accepts a schema-valid reply in a single turn", () => {
   const cwd = makeDirtyGitRepo();
   const { env, argvLog } = withStructuredFakeAgy({
-    replies: [NON_JSON_REVIEW_TEXT, NON_JSON_REVIEW_TEXT]
+    replies: [VALID_REVIEW_JSON]
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.ok(payload.result, "expected a validated result object");
+  assert.equal(payload.result.verdict, "approve");
+  assert.equal(payload.parseError, null);
+  assert.deepEqual(payload.validationErrors, []);
+
+  // Exactly one turn: the runner never spends extra agy calls on a valid reply.
+  assert.equal(promptInvocations(argvLog).length, 1);
+});
+
+test("adversarial-review is fail-closed on non-JSON output: explicit error, exactly one turn, no repair", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [NON_JSON_REVIEW_TEXT]
   });
 
   const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
@@ -806,99 +829,29 @@ test("adversarial-review is fail-closed: schema-invalid output (twice) becomes a
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.result, null);
   assert.ok(payload.parseError, "expected a parseError explaining the failure");
-  assert.equal(payload.repairAttempted, true);
-  assert.equal(payload.repaired, false);
-
-  // Bounded repair: exactly one extra turn, never more.
-  assert.equal(promptInvocations(argvLog).length, 2);
-});
-
-test("adversarial-review repairs a schema-invalid reply on the bounded repair turn and succeeds", () => {
-  const cwd = makeDirtyGitRepo();
-  const { env, argvLog } = withStructuredFakeAgy({
-    replies: [SCHEMA_INVALID_REVIEW_JSON, VALID_REVIEW_JSON]
-  });
-
-  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
-  assert.equal(result.status, 0, result.stdout || result.stderr);
-
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.repairAttempted, true);
-  assert.equal(payload.repaired, true);
-  assert.ok(payload.result, "expected a validated result object");
-  assert.equal(payload.result.verdict, "approve");
-
-  assert.equal(promptInvocations(argvLog).length, 2);
-});
-
-test("adversarial-review invalid twice hits the hard repair cap: exactly one repair turn, then an explicit error", () => {
-  const cwd = makeDirtyGitRepo();
-  const { env, argvLog } = withStructuredFakeAgy({
-    replies: [SCHEMA_INVALID_REVIEW_JSON, SCHEMA_INVALID_REVIEW_JSON]
-  });
-
-  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
-  assert.equal(result.status, 1, result.stdout || result.stderr);
-
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.result, null);
-  assert.equal(payload.repairAttempted, true);
-  assert.equal(payload.repaired, false);
-  assert.match(payload.parseError, /verdict/);
-
-  // Exactly one repair turn was spent (2 total), not a retry loop.
-  assert.equal(promptInvocations(argvLog).length, 2);
-});
-
-test("adversarial-review repair turn resumes the SAME conversation (diff context), not a fresh one", () => {
-  const cwd = makeDirtyGitRepo();
-  const { env, argvLog } = withStructuredFakeAgy({
-    replies: [SCHEMA_INVALID_REVIEW_JSON, VALID_REVIEW_JSON],
-    conversationId: "conv-repair-context-0001"
-  });
-
-  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
-  assert.equal(result.status, 0, result.stdout || result.stderr);
-
-  const promptRuns = promptInvocations(argvLog);
-  assert.equal(promptRuns.length, 2);
-
-  const [initialArgv, repairArgv] = promptRuns;
-  // The initial turn starts a fresh conversation: no resume flag at all.
-  assert.equal(initialArgv.includes("-c"), false);
-  assert.equal(initialArgv.includes("--conversation"), false);
-
-  // The repair turn MUST resume the exact same conversation the initial turn
-  // established (fast path `-c`, since it is the cwd's most-recent) — a fresh
-  // conversation here would have no diff context and could "fix" the JSON
-  // shape into an unfounded approve.
-  assert.ok(
-    repairArgv.includes("-c") || repairArgv.includes("--conversation"),
-    `expected the repair turn to resume a conversation, got argv ${JSON.stringify(repairArgv)}`
-  );
-  if (repairArgv.includes("--conversation")) {
-    assert.equal(repairArgv[repairArgv.indexOf("--conversation") + 1], "conv-repair-context-0001");
-  }
-});
-
-test("adversarial-review skips repair (fail-closed, not a blind retry) when no conversation id is available to resume", () => {
-  const cwd = makeDirtyGitRepo();
-  const { env, argvLog } = withStructuredFakeAgy({
-    replies: [NON_JSON_REVIEW_TEXT],
-    skipConversationId: true
-  });
-
-  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
-  assert.equal(result.status, 1, result.stdout || result.stderr);
-
-  const payload = JSON.parse(result.stdout);
-  assert.equal(payload.result, null);
-  // No repair turn was spent — the runner refused to retry blind in a fresh
-  // conversation, not "approve" it silently.
-  assert.equal(payload.repairAttempted, false);
-  assert.equal(payload.repaired, false);
   assert.notEqual(payload.result?.verdict, "approve");
 
-  // Only the initial turn ran; no second `-p` invocation.
+  // No automatic repair turn: a repair could resume a foreign conversation via
+  // the shared cwd cache and come back schema-valid but ungrounded.
+  assert.equal(promptInvocations(argvLog).length, 1);
+});
+
+test("adversarial-review is fail-closed on schema-invalid JSON: explicit validation error, exactly one turn", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [SCHEMA_INVALID_REVIEW_JSON]
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 1, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.result, null);
+  assert.match(payload.parseError, /verdict/);
+  assert.ok(
+    Array.isArray(payload.validationErrors) && payload.validationErrors.length > 0,
+    "expected schema validation errors to be surfaced"
+  );
+
   assert.equal(promptInvocations(argvLog).length, 1);
 });
