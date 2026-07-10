@@ -398,28 +398,20 @@ export function restoreWorkspaceSnapshot(snapshot) {
     };
   }
 
-  // Capture the CURRENT tracked tree as a dangling stash commit BEFORE the
-  // destructive reset (`git stash create` does not touch the working tree).
-  // The reset below assumes every post-snapshot tracked change belongs to the
-  // rolled-back turn, but that is not guaranteed: a worker can write canonical
-  // `failed` yet leave a stale `running` index row, so a much later cancel
-  // reaches this path after the USER has edited files — a blind reset would
-  // erase their uncommitted work. Recording this recovery point makes the
-  // rollback non-destructive: anything the reset drops stays recoverable via
-  // `git stash apply <recoveryStash>` (review escalation P1, fourth pass).
-  // Untracked files are never touched by `reset --hard`, so they need no capture.
-  let recoveryStash = null;
-  const recovery = git(repoRoot, ["stash", "create"]);
-  if (recovery.status === 0) {
-    recoveryStash = recovery.stdout.trim() || null;
-  }
+  // This performs a destructive `git reset --hard`. It is only ever called for a
+  // job that is being cancelled WHILE (or immediately after being) actively
+  // running, so every post-snapshot working-tree change belongs to that turn.
+  // The caller MUST NOT invoke this for a job that reached a terminal `failed`
+  // status via a stale index — a late cancel there could reset edits the user
+  // made after the failure. That case is handled non-destructively in
+  // `handleCancel` instead (review escalation P1, fourth/fifth pass).
 
   // Reset tracked files (index + working tree) back to the snapshot's HEAD. This
   // discards the turn's tracked edits but does not delete untracked files.
   if (snapshot.head) {
     const reset = git(repoRoot, ["reset", "--hard", snapshot.head]);
     if (reset.status !== 0) {
-      return { restored: false, reason: formatCommandFailure(reset), recoveryStash };
+      return { restored: false, reason: formatCommandFailure(reset) };
     }
   }
 
@@ -434,14 +426,13 @@ export function restoreWorkspaceSnapshot(snapshot) {
         return {
           restored: true,
           partial: true,
-          reason: `Reset to ${snapshot.head}, but could not re-apply pre-run changes: ${formatCommandFailure(applyNoIndex)}`,
-          recoveryStash
+          reason: `Reset to ${snapshot.head}, but could not re-apply pre-run changes: ${formatCommandFailure(applyNoIndex)}`
         };
       }
     }
   }
 
-  return { restored: true, head: snapshot.head, restoredStash: Boolean(snapshot.stashCommit), recoveryStash };
+  return { restored: true, head: snapshot.head, restoredStash: Boolean(snapshot.stashCommit) };
 }
 
 export function collectReviewContext(cwd, target, options = {}) {

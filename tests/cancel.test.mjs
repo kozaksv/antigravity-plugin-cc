@@ -101,12 +101,16 @@ test("cancel does not roll back a job that already completed (its output is pres
 });
 
 /**
- * Counterpart to the above (review-escalation P1, third Codex pass): a FAILED
- * write turn retains its pre-run snapshot precisely so a cancel can roll back
- * the partial edits it left behind. The terminal-status guard must therefore
- * NOT treat `failed` like `completed` — cancel must still roll it back.
+ * A job that reached terminal `failed` but whose index lingered `running` may be
+ * cancelled LONG after the failure, once the user has edited the tree. Cancel
+ * must therefore be NON-destructive for a failed job: it must NOT `git reset
+ * --hard` (which could wipe the user's later work — no recovery capture fully
+ * covers untracked/conflicted state), only report the failure and leave the
+ * workspace as-is (review escalation, passes 3-5). The mid-flight cancel of a
+ * still-running job, where the delta provably belongs to the turn, is what does
+ * roll back — see the completed-vs-running paths.
  */
-test("cancel DOES roll back a failed write job's partial edits (failed != completed)", () => {
+test("cancel does NOT hard-reset a stale failed job; the workspace is left untouched", () => {
   const repo = makeTempDir("antigravity-cancel-failed-repo-");
   const dataDir = makeTempDir("antigravity-cancel-failed-data-");
   const previousData = process.env.CLAUDE_PLUGIN_DATA;
@@ -119,13 +123,12 @@ test("cancel DOES roll back a failed write job's partial edits (failed != comple
     run("git", ["add", "output.txt"], { cwd: repo });
     run("git", ["commit", "-m", "v1"], { cwd: repo });
 
-    // Snapshot of the clean pre-turn state (v1).
     const snapshot = snapshotWorkspace(repo);
-    // The failed turn's HALF-APPLIED garbage edit (v2) that must be rolled back.
-    fs.writeFileSync(file, "v2\n");
+    // Whatever is in the tree now (a failed turn's partial edit and/or the
+    // user's own later work) must survive a cancel of the already-failed job.
+    fs.writeFileSync(file, "users-later-work\n");
 
     const jobId = "task-cancel-failed";
-    // Canonical file: the turn FAILED but retained its snapshot (fix #6).
     writeJobFile(repo, jobId, {
       id: jobId,
       status: "failed",
@@ -135,7 +138,7 @@ test("cancel DOES roll back a failed write job's partial edits (failed != comple
       agyPid: DEAD_PID,
       workspaceSnapshot: snapshot
     });
-    // Index still shows it active, so cancel selects it (the race window).
+    // Index still shows it active, so cancel selects it (the stale-index race).
     saveState(repo, {
       config: { stopReviewGate: false },
       jobs: [
@@ -159,8 +162,17 @@ test("cancel DOES roll back a failed write job's partial edits (failed != comple
     });
     assert.equal(result.status, 0, result.stderr || result.stdout);
 
-    // The failed turn's partial edit MUST be rolled back to the clean snapshot.
-    assert.equal(fs.readFileSync(file, "utf8"), "v1\n", "cancel must roll back a failed write turn's partial edits");
+    // Non-destructive: the working tree is untouched (no git reset --hard).
+    assert.equal(
+      fs.readFileSync(file, "utf8"),
+      "users-later-work\n",
+      "cancel of a stale failed job must not reset the workspace"
+    );
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.cancelled, false);
+    assert.match(payload.status, /failed/);
+    // The report points the user at a manual rollback rather than doing it.
+    assert.match(payload.note, /manual|git reset|left untouched/i);
   } finally {
     if (previousData === undefined) {
       delete process.env.CLAUDE_PLUGIN_DATA;

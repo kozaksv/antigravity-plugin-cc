@@ -58,14 +58,15 @@ State & concurrency:
   fresh new-root state file that would permanently mask — and thereby disable —
   an enabled stop-review gate).
 - A FAILED write turn (e.g. runner timeout mid-edit) preserves its pre-run
-  workspace snapshot on the job record for rollback instead of destroying it,
-  and a cancel still rolls that failed turn back rather than stranding its
-  partial edits.
-- Workspace rollback is now non-destructive: before the `git reset --hard` it
-  captures the current tracked tree as a recovery stash and reports the SHA, so
-  a late cancel of an already-failed job (whose index lingered `running`) can
-  never unrecoverably erase uncommitted edits the user made after the failure —
-  they are restorable with `git stash apply <sha>`.
+  workspace snapshot on the job record instead of destroying it.
+- `/antigravity:cancel` rolls the workspace back with `git reset --hard` ONLY
+  for a genuine mid-flight cancel (a still-`running`/`queued` job), where the
+  whole working-tree delta provably belongs to the turn being cancelled. A job
+  that had already reached terminal `failed` — reachable when its index row
+  lingered `running` — is handled NON-destructively: cancel reports the failure
+  and points at a manual rollback (`git reset --hard <pre-run-commit>`) rather
+  than resetting, so a late cancel can never wipe uncommitted (including
+  untracked or conflict-resolved) work the user did after the failure.
 
 Stop-review gate:
 

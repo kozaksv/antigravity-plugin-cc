@@ -1095,24 +1095,23 @@ async function handleCancel(argv) {
 
   // Every kill target is confirmed stopped, so the CANONICAL job status is now
   // settled — a dead worker cannot write again. Re-read it BEFORE touching the
-  // workspace. A job that SUCCEEDED on its own in the window between selection
-  // and this kill has legitimate output: rolling back the pre-run snapshot
-  // would ERASE it while falsely reporting "nothing to cancel" (review
-  // escalation P1). So `completed` (and an already-`cancelled` job, whose
-  // snapshot was consumed by the earlier cancel) take the untouched path.
+  // workspace and decide by how the job actually ended:
   //
-  // `failed` is deliberately NOT here: a failed WRITE turn retains its pre-run
-  // snapshot precisely so a cancel can roll back the partial edits it left
-  // behind (see runTrackedJob). Treating it as "nothing to cancel" would strand
-  // that garbage in the workspace — so a failed job falls through to the
-  // rollback below (review escalation P1, third pass).
+  //  - `completed`: legitimate output. Rolling back the pre-run snapshot would
+  //    ERASE it, so leave the workspace untouched (review escalation P1, pass 2).
+  //  - `cancelled`: already cancelled; its snapshot was consumed. Untouched.
+  //  - `failed`: the turn failed and its index row lingered `running`, so this
+  //    cancel may be landing LONG after the failure — the user could have edited
+  //    the tree since. A destructive `git reset --hard` here could wipe that
+  //    work (and no recovery capture fully covers untracked / conflicted state —
+  //    review escalation, passes 3-5). Treat it NON-destructively: report the
+  //    failure and the pre-run commit for optional MANUAL rollback, but never
+  //    reset. Only a job still active below is reset (see runTrackedJob), where
+  //    the whole working delta provably belongs to the turn being cancelled.
   const canonical = readStoredJob(workspaceRoot, job.id) ?? existing;
-  const preserveWorkspaceStatuses = new Set(["completed", "cancelled"]);
-  if (preserveWorkspaceStatuses.has(canonical.status)) {
+  if (canonical.status === "completed" || canonical.status === "cancelled") {
     const message = `Job ${job.id} already ${canonical.status} before it could be cancelled; nothing to cancel (workspace left untouched).`;
     appendLogLine(job.logFile, message);
-    // Reconcile the index with the canonical status; leave the job file and the
-    // workspace exactly as the finished worker left them.
     upsertJob(workspaceRoot, { id: job.id, status: canonical.status, pid: null, agyPid: null, workspaceSnapshot: null });
     outputCommandResult(
       { jobId: job.id, status: canonical.status, cancelled: false, note: message },
@@ -1121,17 +1120,27 @@ async function handleCancel(argv) {
     );
     return;
   }
+  if (canonical.status === "failed") {
+    const snapshot = canonical.workspaceSnapshot ?? existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
+    const base = snapshot?.head ? ` It may have left partial edits; review \`git status\` and, if they are unwanted and predate your own work, roll back manually (e.g. \`git reset --hard ${snapshot.head}\`).` : "";
+    const message = `Job ${job.id} had already failed before it could be cancelled; the workspace was left untouched to avoid disturbing any edits you made since.${base}`;
+    appendLogLine(job.logFile, message);
+    upsertJob(workspaceRoot, { id: job.id, status: "failed", pid: null, agyPid: null, workspaceSnapshot: null });
+    outputCommandResult(
+      { jobId: job.id, status: "failed", cancelled: false, note: message },
+      `${message}\n`,
+      options.json
+    );
+    return;
+  }
 
   appendLogLine(job.logFile, "Cancelled by user.");
 
-  // Write tasks run `agy`'s black-box edits directly in the workspace, so a
-  // mid-turn kill (or a failed turn) can leave a half-applied patch. The job is
-  // confirmed stopped and did NOT complete successfully — either still active
-  // (mid-flight cancel) or `failed` — so its edits are an incomplete turn: roll
-  // the working tree back to the pre-task snapshot (which preserves the user's
-  // pre-run changes and only drops the turn's edits). Prefer the freshest
-  // snapshot: a `failed` turn's is on the just-read canonical record. Best
-  // effort: never let cleanup failure block the cancel itself.
+  // The job is confirmed stopped and was still active (`running`/`queued`) — a
+  // genuine mid-flight cancel. Its whole working-tree delta belongs to the turn,
+  // so roll the tree back to the pre-task snapshot (preserving the user's pre-run
+  // changes and dropping only the turn's edits). Best effort: never let cleanup
+  // failure block the cancel itself.
   const snapshot = canonical.workspaceSnapshot ?? existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
   let rollback = null;
   if (snapshot) {
@@ -1143,15 +1152,6 @@ async function handleCancel(argv) {
           ? `Rolled back workspace to the pre-task snapshot${rollback.partial ? ` (partial: ${rollback.reason})` : "."}`
           : `Workspace left as-is: ${rollback.reason}`
       );
-      // The rollback captured the pre-reset tree as a recovery point. Surface it
-      // so a user whose own edits were caught up in the reset (e.g. a late
-      // cancel of an already-failed job) can restore them.
-      if (rollback.recoveryStash) {
-        appendLogLine(
-          job.logFile,
-          `Pre-rollback working tree preserved as ${rollback.recoveryStash} — recover with \`git stash apply ${rollback.recoveryStash}\` if it held your own edits.`
-        );
-      }
     } catch (error) {
       rollback = { restored: false, reason: error instanceof Error ? error.message : String(error) };
       appendLogLine(job.logFile, `Workspace rollback failed: ${rollback.reason}`);
