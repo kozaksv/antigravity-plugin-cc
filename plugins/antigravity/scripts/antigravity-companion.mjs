@@ -1059,7 +1059,18 @@ async function handleCancel(argv) {
   const wrapperPid = existing.pid ?? job.pid ?? null;
   const killTargets = [...new Set([agyPid, wrapperPid].filter((value) => Number.isFinite(value)))];
   for (const pid of killTargets) {
-    terminateProcessTree(pid);
+    // Best effort per target: an EPERM (or an exotic taskkill failure) on one
+    // pid must not crash the CLI mid-cancel — that would skip the workspace
+    // rollback below AND leave the job marked running forever
+    // (review-escalation P1). Log and keep going instead.
+    try {
+      terminateProcessTree(pid);
+    } catch (error) {
+      appendLogLine(
+        job.logFile,
+        `Failed to terminate process ${pid}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
   appendLogLine(job.logFile, "Cancelled by user.");
 
