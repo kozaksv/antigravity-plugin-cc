@@ -11,6 +11,52 @@ function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
 }
 
+// D3: the external Bash timeout used by foreground blocks must strictly
+// exceed the full internal wrapper budget (initial turn + a possible A1
+// repair turn + overhead), so the wrapper self-timeouts before Claude
+// Code's Bash tool kills it. Bash's own timeout is capped at 600000ms, so
+// the internal per-turn budget must be reduced below that ceiling instead.
+const BASH_TIMEOUT_CEILING_MS = 600000;
+
+function extractSection(source, startLabel, endLabel) {
+  const startIndex = source.indexOf(startLabel);
+  assert.notEqual(startIndex, -1, `expected to find "${startLabel}"`);
+  const afterStart = startIndex + startLabel.length;
+  const endIndex = endLabel ? source.indexOf(endLabel, afterStart) : -1;
+  return endIndex === -1 ? source.slice(afterStart) : source.slice(afterStart, endIndex);
+}
+
+function assertForegroundTimeoutIsSafe(section, label) {
+  assert.match(
+    section,
+    /timeout:\s*600000/,
+    `${label}: foreground block must pin the Bash tool timeout to the 600000ms ceiling`
+  );
+  const envMatch = section.match(/ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS[=:\s]+(\d+)/);
+  assert.ok(
+    envMatch,
+    `${label}: foreground block must export ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS with a numeric value`
+  );
+  const perTurnMs = Number(envMatch[1]);
+  assert.ok(perTurnMs > 0, `${label}: per-turn timeout must be positive`);
+  // Worst case is one initial turn plus one A1 repair turn.
+  const worstCaseMs = perTurnMs * 2;
+  assert.ok(
+    worstCaseMs < BASH_TIMEOUT_CEILING_MS,
+    `${label}: worst-case internal budget (${worstCaseMs}ms) must stay strictly under the ${BASH_TIMEOUT_CEILING_MS}ms Bash ceiling`
+  );
+  assert.doesNotMatch(
+    section,
+    /timeout:\s*900000/,
+    `${label}: must not use the 900000ms wrapper default in a foreground block`
+  );
+  assert.match(
+    section,
+    /external.*Bash.*(?:exceed|greater than|larger than|>).*internal|internal.*budget.*(?:before|first|self-timeout)/is,
+    `${label}: must document that the external Bash timeout exceeds the internal wrapper budget`
+  );
+}
+
 test("review command uses AskUserQuestion and background Bash while staying review-only", () => {
   const source = read("commands/review.md");
   assert.match(source, /AskUserQuestion/);
@@ -51,6 +97,24 @@ test("adversarial review command uses AskUserQuestion and background Bash while 
   assert.match(source, /description:\s*"Antigravity adversarial review"/);
   assert.match(source, /Do not call `BashOutput`/);
   assert.doesNotMatch(source, /codex/i);
+});
+
+test("review command foreground block keeps the Bash timeout cascade non-inverted (D3)", () => {
+  const source = read("commands/review.md");
+  const section = extractSection(source, "Foreground flow:", "Background flow:");
+  assertForegroundTimeoutIsSafe(section, "review.md foreground flow");
+});
+
+test("adversarial review command foreground block keeps the Bash timeout cascade non-inverted (D3)", () => {
+  const source = read("commands/adversarial-review.md");
+  const section = extractSection(source, "Foreground flow:", "Background flow:");
+  assertForegroundTimeoutIsSafe(section, "adversarial-review.md foreground flow");
+});
+
+test("antigravity-rescue agent foreground forwarding keeps the Bash timeout cascade non-inverted (D3)", () => {
+  const agent = read("agents/antigravity-rescue.md");
+  const section = extractSection(agent, "Forwarding rules:", "Response style:");
+  assertForegroundTimeoutIsSafe(section, "antigravity-rescue.md forwarding rules");
 });
 
 test("continue is not exposed as a user-facing command", () => {

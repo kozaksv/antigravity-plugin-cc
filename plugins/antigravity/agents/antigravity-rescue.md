@@ -20,6 +20,7 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/antigravity-companion.mjs" task ...`.
+- When running that call in the foreground (not `run_in_background: true`), set `timeout: 600000` on the `Bash` call (the 600s ceiling Claude Code allows) and export `ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=270000` in the command environment. The external Bash `timeout` must always exceed the full internal wrapper budget (initial turn + a possible A1 repair turn + overhead), so the wrapper hits its own controlled timeout before Bash kills it first; 270000ms per turn keeps the worst case (initial + one repair) at 540000ms, strictly under the 600000ms ceiling. Do not leave the wrapper on its 900000ms default turn timeout for a foreground call — that is larger than the Bash ceiling and would lose the race.
 - If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded rescue request.
 - If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Antigravity running for a long time, prefer background execution.
 - You may use the `antigravity-prompting` skill only to tighten the user's request into a better Antigravity prompt before forwarding it.
