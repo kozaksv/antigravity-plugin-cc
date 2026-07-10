@@ -419,6 +419,41 @@ function installExternalKillGuard(getChildPid) {
 }
 
 /**
+ * Resolve the internal per-turn kill timeout (ms). Precedence:
+ *   1. An explicit positive `options.timeoutMs` (caller override) always wins.
+ *   2. Otherwise `ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS` from the run env, when
+ *      it parses to a finite number > 0. This is the knob a foreground command
+ *      (Bash 600s ceiling) and the stop-review hook (spawnSync 840s budget) use
+ *      to shrink the wrapper's internal budget BELOW the external kill, so the
+ *      wrapper self-times-out and reaps `agy` first instead of being killed
+ *      mid-turn — an external kill of the wrapper would orphan the detached
+ *      `agy` process tree.
+ *   3. Otherwise the built-in default.
+ * A present-but-invalid env value (NaN, <= 0, non-numeric) is ignored with a
+ * stderr note rather than silently swallowed, so a typo can't quietly restore
+ * the 900s default and re-lose the timeout race.
+ */
+export function resolveTurnTimeoutMs(options = {}) {
+  const explicit = Number(options.timeoutMs);
+  if (explicit > 0) {
+    return explicit;
+  }
+  const env = options.env ?? process.env;
+  const raw = env?.ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS;
+  if (raw != null && String(raw).trim() !== "") {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+    process.stderr.write(
+      `Ignoring invalid ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=${JSON.stringify(String(raw))}; ` +
+        "expected a positive number of milliseconds. Falling back to the default turn timeout.\n"
+    );
+  }
+  return DEFAULT_TURN_TIMEOUT_MS;
+}
+
+/**
  * Run a single `agy -p` turn. Spawns without a shell (argv array), captures
  * stdout/stderr, and owns its own timeout + process-tree kill because
  * `--print-timeout` is advisory only.
@@ -461,7 +496,7 @@ function spawnAgyTurn(cwd, prompt, options = {}) {
     let timedOut = false;
     let spawnError = null;
 
-    const timeoutMs = Number(options.timeoutMs) > 0 ? Number(options.timeoutMs) : DEFAULT_TURN_TIMEOUT_MS;
+    const timeoutMs = resolveTurnTimeoutMs(options);
     let killTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;

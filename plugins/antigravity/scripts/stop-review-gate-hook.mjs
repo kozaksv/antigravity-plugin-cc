@@ -13,7 +13,17 @@ import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Timeout cascade for the stop-review gate. Each budget must be strictly
+// smaller than the one that would kill it, so the inner layer self-times-out
+// (and reaps its child) BEFORE the outer layer kills it — otherwise the outer
+// kill leaves the inner child orphaned in the background:
+//   inner agy-turn (780s)  <  spawnSync (840s)  <  hook Stop timeout (900s, hooks.json)
+// The inner agy-turn budget is handed to the child companion via the
+// ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS env var (read by resolveTurnTimeoutMs in
+// lib/antigravity.mjs); without it the wrapper keeps its 900s default and
+// spawnSync would kill it at 840s first, orphaning the detached `agy`.
+const STOP_REVIEW_TURN_TIMEOUT_MS = 13 * 60 * 1000; // 780000
+const STOP_REVIEW_SPAWN_TIMEOUT_MS = 14 * 60 * 1000; // 840000
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 
@@ -123,20 +133,24 @@ function runStopReview(cwd, input = {}) {
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
-    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
+    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {}),
+    // Shrink the child's internal agy-turn budget below our spawnSync timeout so
+    // the wrapper self-times-out and reaps `agy` before spawnSync would kill it
+    // (a spawnSync kill of the wrapper orphans the detached `agy`).
+    ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS: String(STOP_REVIEW_TURN_TIMEOUT_MS)
   };
   const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
     cwd,
     env: childEnv,
     encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
+    timeout: STOP_REVIEW_SPAWN_TIMEOUT_MS
   });
 
   if (result.error?.code === "ETIMEDOUT") {
     return {
       ok: false,
       reason:
-        "The stop-time Antigravity review task timed out after 15 minutes. Run /antigravity:review --wait manually or bypass the gate."
+        "The stop-time Antigravity review task timed out after 14 minutes. Run /antigravity:review --wait manually or bypass the gate."
     };
   }
 

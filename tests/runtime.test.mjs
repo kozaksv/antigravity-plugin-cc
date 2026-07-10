@@ -31,10 +31,13 @@ const {
   readAgyLogFile,
   runReview,
   runTurn,
+  resolveTurnTimeoutMs,
   parseStructuredOutput,
   assertPromptWithinLimit,
   MAX_PROMPT_BYTES
 } = await import(path.join(PLUGIN_ROOT, "scripts", "lib", "antigravity.mjs"));
+
+const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
 
 function withFakeAgy(options = {}) {
   const binDir = makeTempDir("antigravity-bin-");
@@ -464,6 +467,48 @@ test("runTurn surfaces a failure when agy exits non-zero", async () => {
 test("runTurn kills a hanging agy process via its own timeout", async () => {
   const { env, cwd } = withFakeAgy({ behavior: "hang" });
   const result = await runTurn(cwd, { prompt: "hang forever", env, timeoutMs: 500 });
+  assert.equal(result.status, 1);
+  assert.ok(result.error);
+  assert.match(result.error.message, /timeout|terminated/i);
+});
+
+test("resolveTurnTimeoutMs: explicit options.timeoutMs wins over env and default", () => {
+  // Explicit caller override beats a (larger) env value and the default.
+  assert.equal(
+    resolveTurnTimeoutMs({ timeoutMs: 500, env: { ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS: "999999999" } }),
+    500
+  );
+});
+
+test("resolveTurnTimeoutMs: reads a valid env var as the fallback when no explicit timeout", () => {
+  assert.equal(
+    resolveTurnTimeoutMs({ env: { ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS: "270000" } }),
+    270000
+  );
+});
+
+test("resolveTurnTimeoutMs: ignores an invalid env var and falls back to the default", () => {
+  for (const bad of ["not-a-number", "0", "-5", "NaN", ""]) {
+    assert.equal(
+      resolveTurnTimeoutMs({ env: { ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS: bad } }),
+      DEFAULT_TURN_TIMEOUT_MS,
+      `env value ${JSON.stringify(bad)} must be ignored`
+    );
+  }
+});
+
+test("resolveTurnTimeoutMs: uses the default when neither an explicit timeout nor env is set", () => {
+  assert.equal(resolveTurnTimeoutMs({ env: {} }), DEFAULT_TURN_TIMEOUT_MS);
+});
+
+test("runTurn honors ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS end-to-end (env shrinks the inner turn budget)", async () => {
+  // No explicit options.timeoutMs — the only timeout source is the env var the
+  // foreground commands / stop hook export. A hanging agy must be killed by the
+  // wrapper's own internal timer sourced from that env var, proving the runtime
+  // actually reads it (not just the .md command that sets it).
+  const { env, cwd } = withFakeAgy({ behavior: "hang" });
+  env.ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS = "500";
+  const result = await runTurn(cwd, { prompt: "hang forever", env });
   assert.equal(result.status, 1);
   assert.ok(result.error);
   assert.match(result.error.message, /timeout|terminated/i);
