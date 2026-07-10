@@ -214,20 +214,37 @@ function migrateLegacyConfigIfNeeded(cwd) {
   if (migrationCheckedStateDirs.has(stateDir)) {
     return;
   }
-  migrationCheckedStateDirs.add(stateDir);
 
   const stateFile = resolveStateFile(cwd);
   const legacyFile = resolveLegacyStateFile(cwd);
   if (stateFile === legacyFile || fs.existsSync(stateFile)) {
+    migrationCheckedStateDirs.add(stateDir);
     return; // already on the legacy root (nothing to migrate to), or migrated
   }
 
   let raw;
   try {
     raw = fs.readFileSync(legacyFile, "utf8");
-  } catch {
-    return; // no legacy state — fresh workspace
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      migrationCheckedStateDirs.add(stateDir); // definitively no legacy state
+      return; // fresh workspace
+    }
+    // The legacy file EXISTS but is unreadable right now (EACCES, EIO, EMFILE,
+    // ...). Treating that as "no legacy state" would let a later job write
+    // create fresh default state in the new root, permanently stranding an
+    // enabled stopReviewGate (fail-open on a security toggle). Do NOT mark this
+    // dir checked — so the next state access retries the migration — and warn
+    // instead of silently continuing (review escalation P2).
+    process.stderr.write(
+      `[antigravity] Could not read legacy state at ${legacyFile} ` +
+        `(${error?.code ?? (error instanceof Error ? error.message : String(error))}); not migrating this run. ` +
+        "If the stop-review gate was enabled, it may be inactive until this is resolved.\n"
+    );
+    return;
   }
+  // From here the read succeeded: whatever the outcome, this dir is resolved.
+  migrationCheckedStateDirs.add(stateDir);
 
   let legacyConfig;
   try {
@@ -502,21 +519,29 @@ function readCanonicalJobOrNull(cwd, jobId) {
  * lock it re-reads the CURRENT canonical status, not the snapshot it read
  * earlier.
  *
- * A rejected write is a silent no-op (the file on disk is left exactly as
- * it was) rather than a thrown error, matching every existing call site's
- * fire-and-forget usage of `writeJobFile`.
+ * A rejected write is a no-op on disk (the file is left exactly as it was)
+ * rather than a thrown error, matching every existing call site's
+ * fire-and-forget usage. The RETURN value now reports the outcome
+ * (`{ jobFile, applied, canonicalStatus }`) so a caller that must not lie
+ * about the result — e.g. `/antigravity:cancel`, which would otherwise report
+ * a clean cancellation even when a worker had already committed `completed`
+ * and the CAS rejected the `cancelled` write — can react to a rejection.
  */
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
+  let applied = true;
+  let canonicalStatus = payload.status ?? null;
   withFileLock(resolveJobLockFile(cwd, jobId), () => {
     const current = readCanonicalJobOrNull(cwd, jobId);
     if (current && TERMINAL_JOB_STATUSES.has(current.status) && payload.status !== current.status) {
+      applied = false;
+      canonicalStatus = current.status; // the terminal status that won
       return; // CAS reject: terminal status is final.
     }
     atomicWriteFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   });
-  return jobFile;
+  return { jobFile, applied, canonicalStatus };
 }
 
 export function readJobFile(jobFile) {

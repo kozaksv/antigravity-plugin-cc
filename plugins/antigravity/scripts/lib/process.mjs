@@ -215,6 +215,31 @@ export function terminateProcessTree(pid, options = {}) {
 }
 
 /**
+ * Terminate several process trees, reporting whether EVERY target was stopped.
+ *
+ * `terminateProcessTree` returns (never throws) when it either delivered a
+ * signal or found the target already gone (ESRCH) — both count as "stopped".
+ * It THROWS only when a signal could not be delivered at all (EPERM, an exotic
+ * taskkill failure): that target may still be LIVE, so `allStopped` goes false
+ * and the caller (e.g. `/antigravity:cancel`) can refuse to take destructive
+ * follow-up action (workspace rollback, terminal status) against a live writer.
+ * `onError(pid, error)` is invoked per failing target for logging.
+ */
+export function terminateProcessTrees(pids, options = {}) {
+  const terminate = options.terminate ?? terminateProcessTree;
+  let allStopped = true;
+  for (const pid of pids) {
+    try {
+      terminate(pid, options.terminateOptions ?? {});
+    } catch (error) {
+      allStopped = false;
+      options.onError?.(pid, error);
+    }
+  }
+  return { allStopped };
+}
+
+/**
  * Send `signal` to a POSIX process group first, falling back to the bare pid.
  * Returns whether the signal reached anything and which target form was used.
  */

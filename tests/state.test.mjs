@@ -592,3 +592,99 @@ test("reclaimStaleEntry aborts when the entry's content changes between the stal
   assert.equal(result.reclaimed, false);
   assert.equal(result.aborted, true);
 });
+
+// --- writeJobFile CAS return contract (cancel must not lie about the result) ---
+
+test("writeJobFile returns applied:true and the written status on an accepted write", () => {
+  const workspace = makeTempDir();
+  const jobId = "job-cas-applied";
+  const result = writeJobFile(workspace, jobId, { id: jobId, status: "running" });
+  assert.equal(result.applied, true);
+  assert.equal(result.canonicalStatus, "running");
+  assert.ok(result.jobFile.endsWith(`${jobId}.json`));
+});
+
+test("writeJobFile returns applied:false and the winning terminal status when the CAS rejects", () => {
+  const workspace = makeTempDir();
+  const jobId = "job-cas-rejected";
+  // A worker committed `completed` first ...
+  writeJobFile(workspace, jobId, { id: jobId, status: "completed" });
+  // ... then a racing cancel tries to write `cancelled`: the CAS rejects it,
+  // and the return must surface that so /antigravity:cancel reports the truth
+  // instead of a clean cancellation (review escalation P2).
+  const result = writeJobFile(workspace, jobId, { id: jobId, status: "cancelled" });
+  assert.equal(result.applied, false);
+  assert.equal(result.canonicalStatus, "completed");
+  assert.equal(readJobFile(resolveJobFile(workspace, jobId)).status, "completed");
+});
+
+// --- legacy migration: only ENOENT means "no legacy state" ---
+
+test("an unreadable (non-ENOENT) legacy state file does not strand the gate: it is retried, not skipped", () => {
+  const workspace = makeTempDir();
+  const legacyDir = seedLegacyState(
+    workspace,
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: true }, jobs: [] })}\n`
+  );
+  const legacyFile = path.join(legacyDir, "state.json");
+
+  // Make the legacy file unreadable (EACCES). Skip on platforms/users where
+  // chmod 000 does not actually deny read (e.g. running as root in CI).
+  fs.chmodSync(legacyFile, 0o000);
+  let deniedRead = false;
+  try {
+    fs.readFileSync(legacyFile, "utf8");
+  } catch (error) {
+    deniedRead = error?.code === "EACCES" || error?.code === "EPERM";
+  }
+
+  try {
+    if (!deniedRead) {
+      return; // environment cannot simulate the read failure; nothing to assert
+    }
+
+    // While unreadable, migration must NOT silently mark the workspace fresh
+    // (which would let a later write disable the gate). getConfig sees defaults
+    // for now, but the legacy file is left pending, not consumed.
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+    assert.equal(fs.existsSync(resolveStateFile(workspace)), false, "no fresh state may be written over a pending migration");
+
+    // Once the file becomes readable again, the retried migration recovers the gate.
+    fs.chmodSync(legacyFile, 0o600);
+    assert.equal(getConfig(workspace).stopReviewGate, true);
+  } finally {
+    fs.chmodSync(legacyFile, 0o600);
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+  }
+});
+
+// --- file-lock link-trick: the canonical lock is never observed empty ---
+
+test("acquireFileLockSync publishes a fully-written lock (never an empty canonical file)", () => {
+  const dir = makeTempDir();
+  const lockPath = path.join(dir, "x.lock");
+  const handle = acquireFileLockSync(lockPath, { pid: 4242 });
+  // The instant the canonical lock exists it already carries its payload — the
+  // link-trick leaves no empty/partial window (review escalation P1).
+  const raw = fs.readFileSync(lockPath, "utf8");
+  assert.ok(raw.trim().length > 0, "canonical lock must never be empty");
+  const parsed = JSON.parse(raw);
+  assert.equal(parsed.pid, 4242);
+  assert.equal(parsed.token, handle.token);
+  // No stray `.mk` temp file is left behind in the lock directory.
+  assert.equal(fs.readdirSync(dir).some((name) => name.includes(".mk")), false);
+  handle.release();
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test("acquireFileLockSync still mutually excludes a live holder after the link-trick change", () => {
+  const dir = makeTempDir();
+  const lockPath = path.join(dir, "x.lock");
+  const held = acquireFileLockSync(lockPath, { pid: process.pid });
+  // A second acquisition against a live holder must block and time out.
+  assert.throws(
+    () => acquireFileLockSync(lockPath, { timeoutMs: 250, pollMs: 50 }),
+    /Timed out waiting for file lock/
+  );
+  held.release();
+});

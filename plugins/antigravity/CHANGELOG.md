@@ -37,8 +37,22 @@ State & concurrency:
   write cleans up after itself.
 - Session-end teardown captures jobs, kills processes and rolls back snapshots
   OUTSIDE the state lock, then removes records in one atomic write; SessionEnd
-  hook timeout raised 5s -> 60s. `/antigravity:cancel` survives kill errors
-  (EPERM no longer skips rollback and the cancelled-status write).
+  hook timeout raised 5s -> 60s. `/antigravity:cancel` survives kill errors:
+  when a target process cannot be confirmed stopped it refuses to roll back the
+  workspace or write a terminal `cancelled` status (which would corrupt a live
+  writer's tree and hide a running job), reporting the cancel as incomplete
+  instead; and when the worker already committed a terminal status first, the
+  CAS rejection is surfaced rather than reported as a clean cancellation.
+- The file lock creates its file with the payload already written (temp file +
+  atomic `link`), so the canonical lock is never observed empty — closing a
+  TOCTOU where a creator stalled past the empty-grace window could have its
+  live lock displaced, breaking mutual exclusion. Contended-lock acquire
+  timeout raised 5s -> 10s so a burst of state writers on a slow filesystem no
+  longer times out spuriously.
+- The legacy-state migration treats only ENOENT as "no legacy state"; an
+  unreadable (EACCES/EIO) legacy file that actually exists is warned about and
+  retried on the next access rather than being taken as a fresh workspace,
+  which would have stranded an enabled stop-review gate.
 - A FAILED write turn (e.g. runner timeout mid-edit) preserves its pre-run
   workspace snapshot on the job record for rollback instead of destroying it.
 
@@ -55,7 +69,10 @@ CLI correctness:
 
 - `--effort` actually works now: values narrowed to `low|medium|high` and folded
   into the agy model-label suffix (`Gemini 3.5 Flash (High)`); labels without an
-  effort variant error instead of silently dropping the flag.
+  effort variant error instead of silently dropping the flag, and an effort a
+  family does not offer (Gemini Pro has no Medium; GPT-OSS is Medium-only) is
+  rejected with the family's real levels instead of fabricating a label agy
+  rejects.
 - Self-collect review context lists untracked files by name+size instead of
   inlining their bodies (kept large working trees under the 128 KiB prompt cap).
 - The auth probe in `/antigravity:setup` runs from a throwaway temp directory,

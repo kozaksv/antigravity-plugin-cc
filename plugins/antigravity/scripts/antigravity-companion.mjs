@@ -29,7 +29,7 @@ import {
   restoreWorkspaceSnapshot,
   snapshotWorkspace
 } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, terminateProcessTrees } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -1060,27 +1060,45 @@ async function handleCancel(argv) {
   const agyPid = existing.agyPid ?? job.agyPid ?? null;
   const wrapperPid = existing.pid ?? job.pid ?? null;
   const killTargets = [...new Set([agyPid, wrapperPid].filter((value) => Number.isFinite(value)))];
-  for (const pid of killTargets) {
-    // Best effort per target: an EPERM (or an exotic taskkill failure) on one
-    // pid must not crash the CLI mid-cancel — that would skip the workspace
-    // rollback below AND leave the job marked running forever
-    // (review-escalation P1). Log and keep going instead.
-    try {
-      terminateProcessTree(pid);
-    } catch (error) {
-      appendLogLine(
-        job.logFile,
-        `Failed to terminate process ${pid}: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+  const { allStopped } = terminateProcessTrees(killTargets, {
+    onError: (pid, error) =>
+      appendLogLine(job.logFile, `Failed to terminate process ${pid}: ${error instanceof Error ? error.message : String(error)}`)
+  });
+
+  // `terminateProcessTree` throwing means the signal could NOT be delivered
+  // (EPERM/exotic taskkill failure) — the target may still be a LIVE `agy`
+  // editing the workspace. Rolling back now would corrupt a live writer's
+  // tree, and writing a terminal `cancelled` would both hide a still-running
+  // job from active views and (for a write task) drop the rollback snapshot.
+  // So on an unconfirmed stop: change NOTHING destructive, keep the record and
+  // its snapshot, and report the cancel as incomplete (review escalation P1).
+  if (!allStopped) {
+    const message =
+      `Cancel could not confirm every process for ${job.id} stopped; the job is left running ` +
+      `and the workspace untouched. Retry \`/antigravity:cancel ${job.id}\`, or inspect \`/antigravity:status ${job.id}\`.`;
+    appendLogLine(job.logFile, message);
+    process.exitCode = 1;
+    outputCommandResult(
+      {
+        jobId: job.id,
+        status: existing.status ?? job.status ?? "running",
+        cancelled: false,
+        cleanupError: message
+      },
+      `${message}\n`,
+      options.json
+    );
+    return;
   }
+
   appendLogLine(job.logFile, "Cancelled by user.");
 
   // Write tasks run `agy`'s black-box edits directly in the workspace, so a
   // mid-turn kill can leave a half-applied patch. Roll the working tree back to
   // the snapshot captured before the turn (which preserves the user's pre-run
   // changes and only drops the turn's edits). Best effort: never let cleanup
-  // failure block the cancel itself.
+  // failure block the cancel itself. Safe now: every target is confirmed
+  // stopped (or was already gone), so no live writer races the reset.
   const snapshot = existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
   let rollback = null;
   if (snapshot) {
@@ -1109,13 +1127,32 @@ async function handleCancel(argv) {
     errorMessage: "Cancelled by user."
   };
 
-  writeJobFile(workspaceRoot, job.id, {
+  // `writeJobFile`'s CAS rejects the `cancelled` write when the worker already
+  // committed a terminal status (e.g. it finished `completed` in the window
+  // between job selection and this write). Do not then report a clean cancel:
+  // surface the status that actually won on disk (review escalation P2).
+  const write = writeJobFile(workspaceRoot, job.id, {
     ...existing,
     ...nextJob,
     // Snapshot consumed (or never present); drop it so it cannot be re-applied.
     workspaceSnapshot: null,
     cancelledAt: completedAt
   });
+
+  if (!write.applied) {
+    const finalStatus = write.canonicalStatus ?? "finished";
+    const message = `Job ${job.id} already ${finalStatus} before it could be cancelled; nothing to cancel.`;
+    appendLogLine(job.logFile, message);
+    // Reconcile the index with the canonical terminal status the worker wrote.
+    upsertJob(workspaceRoot, { id: job.id, status: finalStatus, pid: null, agyPid: null, workspaceSnapshot: null });
+    outputCommandResult(
+      { jobId: job.id, status: finalStatus, cancelled: false, note: message },
+      `${message}\n`,
+      options.json
+    );
+    return;
+  }
+
   upsertJob(workspaceRoot, {
     id: job.id,
     status: "cancelled",

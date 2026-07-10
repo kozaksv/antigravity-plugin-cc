@@ -101,6 +101,21 @@ const EFFORT_SUFFIXES = new Map([
 ]);
 
 /**
+ * Which effort suffixes each model family actually exposes in `agy models`.
+ * NOT every family offers all three: Gemini Pro has no Medium, GPT-OSS is
+ * Medium-only. Blindly rewriting the suffix (the earlier behavior) fabricated
+ * nonexistent labels like "Gemini 3.1 Pro (Medium)" that fail at `agy`, so a
+ * recognized family validates the requested effort against this set. An
+ * UNrecognized family (a future model) is not in the map and is left to pass
+ * through with the suffix applied, rather than being rejected outright.
+ */
+const MODEL_EFFORT_VARIANTS = new Map([
+  ["Gemini 3.5 Flash", new Set(["Low", "Medium", "High"])],
+  ["Gemini 3.1 Pro", new Set(["Low", "High"])],
+  ["GPT-OSS 120B", new Set(["Medium"])]
+]);
+
+/**
  * `agy` has no effort flag: effort is the `(Low|Medium|High)` suffix of the
  * model label (see `agy models`). Map a normalized effort onto the model:
  *  - no effort -> the (alias-resolved) model unchanged;
@@ -109,7 +124,9 @@ const EFFORT_SUFFIXES = new Map([
  *  - effort + a bare family name ("Gemini 3.5 Flash") -> suffix appended;
  *  - effort + a label with a NON-effort parenthesized suffix (e.g.
  *    "Claude Sonnet 4.6 (Thinking)") -> a clear error, because silently
- *    dropping the flag is exactly the no-op this replaces.
+ *    dropping the flag is exactly the no-op this replaces;
+ *  - effort not offered by a recognized family (e.g. Pro + Medium) -> a clear
+ *    error listing the family's real levels, instead of a label agy rejects.
  */
 export function resolveModelWithEffort(model, effort) {
   const resolvedModel = resolveModelAlias(model);
@@ -123,16 +140,23 @@ export function resolveModelWithEffort(model, effort) {
 
   const base = resolvedModel ?? DEFAULT_EFFORT_BASE_MODEL;
   const suffixMatch = base.match(/^(.*)\s\((?:Low|Medium|High)\)$/);
-  if (suffixMatch) {
-    return `${suffixMatch[1]} (${suffix})`;
-  }
-  if (/\(.+\)\s*$/.test(base)) {
+  if (!suffixMatch && /\(.+\)\s*$/.test(base)) {
     throw new Error(
       `--effort does not apply to model "${base}": its label has no (Low|Medium|High) effort variant in \`agy models\`. ` +
         "Pick a Gemini model (e.g. `flash`, `pro`) or drop --effort."
     );
   }
-  return `${base} (${suffix})`;
+
+  const family = suffixMatch ? suffixMatch[1] : base;
+  const variants = MODEL_EFFORT_VARIANTS.get(family);
+  if (variants && !variants.has(suffix)) {
+    const available = [...variants].join(", ");
+    throw new Error(
+      `--effort ${effort} is not available for "${family}": \`agy models\` offers only ${available}. ` +
+        "Pick one of those levels, choose a model with more variants, or drop --effort."
+    );
+  }
+  return `${family} (${suffix})`;
 }
 
 function cleanStderr(stderr) {

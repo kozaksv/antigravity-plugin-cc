@@ -362,30 +362,51 @@ function isLockStale(raw, stat, { killImpl, emptyGraceMs }) {
   return Date.now() - stat.mtimeMs >= emptyGraceMs;
 }
 
+/**
+ * Create the lock at `lockPath` with its payload ALREADY written, atomically.
+ *
+ * The naive `open(lockPath, "wx")` then `writeSync` leaves a window where the
+ * canonical lock exists but is still empty — which forced the empty-grace
+ * reclaim heuristic and, with it, a TOCTOU where a creator stalled past that
+ * grace could have its live lock renamed aside and displaced by a racer,
+ * breaking mutual exclusion (review escalation P1). Instead: write the payload
+ * to a PRIVATE temp file, then `link` it into the canonical path. `link` is
+ * atomic and fails `EEXIST` when the lock is already held (same mutual
+ * exclusion as O_EXCL), and on success the canonical name appears already
+ * carrying its payload — there is never an empty/partial lock for a peer to
+ * observe or wrongly reclaim.
+ */
 function tryCreateLock(lockPath, pid, token) {
+  const tmpPath = `${lockPath}.${pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.mk`;
   let fd;
   try {
-    fd = fs.openSync(lockPath, "wx");
+    fd = fs.openSync(tmpPath, "wx");
   } catch (error) {
     if (error?.code === "EEXIST") {
-      return false;
+      return false; // our private temp name collided (astronomically rare); back off
     }
     throw error;
   }
   try {
     fs.writeSync(fd, JSON.stringify({ pid, token, createdAt: new Date().toISOString() }));
+  } finally {
+    fs.closeSync(fd);
+  }
+  try {
+    fs.linkSync(tmpPath, lockPath); // atomic publish; EEXIST => already held
   } catch (error) {
-    // Payload write failed (e.g. ENOSPC): without cleanup this leaves an empty
-    // lock that blocks every peer for the whole empty-grace window even though
-    // no one holds it. Best-effort unlink, then surface the original error.
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {
-      // best effort
+    if (error?.code === "EEXIST") {
+      return false;
     }
     throw error;
   } finally {
-    fs.closeSync(fd);
+    // The link (success or EEXIST) left our temp copy behind; drop it so only
+    // the canonical name — or nothing — remains.
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // best effort
+    }
   }
   return true;
 }

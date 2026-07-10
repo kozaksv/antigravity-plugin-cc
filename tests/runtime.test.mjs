@@ -900,6 +900,23 @@ test("resolveModelWithEffort maps effort onto model labels and fails on non-effo
   assert.throws(() => resolveModelWithEffort(null, "xhigh"), /Unsupported reasoning effort/);
 });
 
+test("resolveModelWithEffort rejects effort levels a model family does not offer (no fabricated labels)", () => {
+  // `agy models`: Gemini Pro has only Low/High (no Medium); GPT-OSS is
+  // Medium-only. Blindly rewriting the suffix produced labels agy rejects.
+  assert.throws(() => resolveModelWithEffort("pro", "medium"), /not available for "Gemini 3\.1 Pro".*Low, High/);
+  assert.throws(() => resolveModelWithEffort("gpt-oss", "low"), /not available for "GPT-OSS 120B".*Medium/);
+  assert.throws(() => resolveModelWithEffort("gpt-oss", "high"), /not available for "GPT-OSS 120B".*Medium/);
+
+  // The levels each family DOES offer still resolve.
+  assert.equal(resolveModelWithEffort("pro", "high"), "Gemini 3.1 Pro (High)");
+  assert.equal(resolveModelWithEffort("pro", "low"), "Gemini 3.1 Pro (Low)");
+  assert.equal(resolveModelWithEffort("gpt-oss", "medium"), "GPT-OSS 120B (Medium)");
+
+  // An unrecognized (future) family is not in the catalog, so it is left to
+  // pass through with the suffix applied rather than rejected outright.
+  assert.equal(resolveModelWithEffort("Gemini 9 Ultra", "high"), "Gemini 9 Ultra (High)");
+});
+
 test("task --effort high reaches agy as --model \"Gemini 3.5 Flash (High)\"", () => {
   const { env, cwd, argvLog } = withFakeAgy();
 
