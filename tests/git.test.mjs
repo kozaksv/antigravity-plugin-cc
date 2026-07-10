@@ -287,6 +287,34 @@ test("snapshotWorkspace + restoreWorkspaceSnapshot roll back a turn's tracked ed
   assert.doesNotMatch(restored, /half-applied-by-agy/);
 });
 
+test("restoreWorkspaceSnapshot anchors a DURABLE recovery ref before the reset (gc-safe, recoverable)", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'committed';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const snapshot = snapshotWorkspace(cwd);
+
+  // A tracked change that does NOT belong to the cancelled turn (e.g. a
+  // concurrent foreground+background write, or the user's own edit) sits in the
+  // tree at rollback time (review escalation, sixth pass).
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'concurrent-work';\n");
+
+  const result = restoreWorkspaceSnapshot(snapshot);
+  assert.equal(result.restored, true);
+  // The reset happened ...
+  assert.match(fs.readFileSync(path.join(cwd, "app.js"), "utf8"), /committed/);
+  // ... but the concurrent edit is recoverable from a REAL ref (not a dangling
+  // object git gc could prune), under the plugin's namespace.
+  assert.ok(result.recoveryRef, "a durable recovery ref must be returned");
+  assert.match(result.recoveryRef, /^refs\/antigravity\/cancel-backup\//);
+  const resolved = run("git", ["rev-parse", "--verify", result.recoveryRef], { cwd });
+  assert.equal(resolved.status, 0, "the recovery ref must actually exist in the repo");
+  const show = run("git", ["show", `${result.recoveryRef}:app.js`], { cwd });
+  assert.match(show.stdout, /concurrent-work/);
+});
+
 test("restoreWorkspaceSnapshot leaves the tree in place when HEAD moved (new commits)", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);

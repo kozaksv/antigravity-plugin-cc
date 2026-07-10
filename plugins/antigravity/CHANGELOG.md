@@ -60,13 +60,16 @@ State & concurrency:
 - A FAILED write turn (e.g. runner timeout mid-edit) preserves its pre-run
   workspace snapshot on the job record instead of destroying it.
 - `/antigravity:cancel` rolls the workspace back with `git reset --hard` ONLY
-  for a genuine mid-flight cancel (a still-`running`/`queued` job), where the
-  whole working-tree delta provably belongs to the turn being cancelled. A job
-  that had already reached terminal `failed` — reachable when its index row
-  lingered `running` — is handled NON-destructively: cancel reports the failure
-  and points at a manual rollback (`git reset --hard <pre-run-commit>`) rather
-  than resetting, so a late cancel can never wipe uncommitted (including
-  untracked or conflict-resolved) work the user did after the failure.
+  for a genuine mid-flight cancel (a still-`running`/`queued` job); a job that
+  had already reached terminal `failed` (reachable when its index row lingered
+  `running`) is handled NON-destructively — cancel reports the failure and
+  points at a non-destructive review (`git status` / `git restore <path>`)
+  rather than resetting, so a late cancel can never wipe work the user did after
+  the failure. Even the mid-flight reset first anchors the current tracked tree
+  under a durable `refs/antigravity/cancel-backup/*` ref (and aborts rather than
+  reset if that backup cannot be made), so a reset that catches up concurrent
+  edits — a foreground `task --write` overlapping a background write, or a
+  hand-edit during a run — stays recoverable via that ref.
 
 Stop-review gate:
 

@@ -398,20 +398,48 @@ export function restoreWorkspaceSnapshot(snapshot) {
     };
   }
 
-  // This performs a destructive `git reset --hard`. It is only ever called for a
-  // job that is being cancelled WHILE (or immediately after being) actively
-  // running, so every post-snapshot working-tree change belongs to that turn.
-  // The caller MUST NOT invoke this for a job that reached a terminal `failed`
-  // status via a stale index — a late cancel there could reset edits the user
-  // made after the failure. That case is handled non-destructively in
-  // `handleCancel` instead (review escalation P1, fourth/fifth pass).
+  // This performs a destructive `git reset --hard`. It is only called for a job
+  // cancelled while actively running (never for a terminal `failed` job — that
+  // is handled non-destructively in `handleCancel`). But even here the tree can
+  // legitimately hold tracked changes that do NOT belong to the cancelled turn:
+  // a foreground `task --write` bypasses the concurrency slot, so it can overlap
+  // a background write in the same workspace, and the user can hand-edit during
+  // a run. So capture a DURABLE recovery point first (review escalation, sixth
+  // pass): `git stash create` snapshots the current tracked tree, and we anchor
+  // it under a real ref so `git gc` cannot prune it (pass 5). If that capture
+  // fails — e.g. an unresolved-conflict index makes `stash create` error — ABORT
+  // rather than reset without a backup (pass 5). Untracked paths are not
+  // captured; `reset --hard` only removes an untracked path that OBSTRUCTS a
+  // tracked one (rare) — a documented residual.
+  let recoveryRef = null;
+  let recoverySha = null;
+  if (snapshot.head) {
+    const created = git(repoRoot, ["stash", "create"]);
+    if (created.status !== 0) {
+      return {
+        restored: false,
+        reason: `Could not capture a recovery point before rollback (${formatCommandFailure(created)}); left in place.`
+      };
+    }
+    recoverySha = created.stdout.trim() || null;
+    if (recoverySha) {
+      recoveryRef = `refs/antigravity/cancel-backup/${Date.now()}-${recoverySha.slice(0, 8)}`;
+      const anchored = git(repoRoot, ["update-ref", recoveryRef, recoverySha]);
+      if (anchored.status !== 0) {
+        return {
+          restored: false,
+          reason: `Could not persist the recovery point before rollback (${formatCommandFailure(anchored)}); left in place.`
+        };
+      }
+    }
+  }
 
   // Reset tracked files (index + working tree) back to the snapshot's HEAD. This
   // discards the turn's tracked edits but does not delete untracked files.
   if (snapshot.head) {
     const reset = git(repoRoot, ["reset", "--hard", snapshot.head]);
     if (reset.status !== 0) {
-      return { restored: false, reason: formatCommandFailure(reset) };
+      return { restored: false, reason: formatCommandFailure(reset), recoveryRef, recoverySha };
     }
   }
 
@@ -426,13 +454,15 @@ export function restoreWorkspaceSnapshot(snapshot) {
         return {
           restored: true,
           partial: true,
-          reason: `Reset to ${snapshot.head}, but could not re-apply pre-run changes: ${formatCommandFailure(applyNoIndex)}`
+          reason: `Reset to ${snapshot.head}, but could not re-apply pre-run changes: ${formatCommandFailure(applyNoIndex)}`,
+          recoveryRef,
+          recoverySha
         };
       }
     }
   }
 
-  return { restored: true, head: snapshot.head, restoredStash: Boolean(snapshot.stashCommit) };
+  return { restored: true, head: snapshot.head, restoredStash: Boolean(snapshot.stashCommit), recoveryRef, recoverySha };
 }
 
 export function collectReviewContext(cwd, target, options = {}) {

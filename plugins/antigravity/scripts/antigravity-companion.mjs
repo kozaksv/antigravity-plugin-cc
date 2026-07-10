@@ -1122,8 +1122,15 @@ async function handleCancel(argv) {
   }
   if (canonical.status === "failed") {
     const snapshot = canonical.workspaceSnapshot ?? existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
-    const base = snapshot?.head ? ` It may have left partial edits; review \`git status\` and, if they are unwanted and predate your own work, roll back manually (e.g. \`git reset --hard ${snapshot.head}\`).` : "";
-    const message = `Job ${job.id} had already failed before it could be cancelled; the workspace was left untouched to avoid disturbing any edits you made since.${base}`;
+    // Guidance must NOT suggest a bare `git reset --hard <head>`: the turn may
+    // have started from a DIRTY tree whose pre-run edits live only in the
+    // snapshot's stash commit, so a bare reset would erase the user's own
+    // pre-run work along with the failed turn's output (review escalation P1,
+    // sixth pass). Point at a non-destructive review instead.
+    const guidance = snapshot?.head
+      ? " It may have left partial edits mixed into your working tree; review with `git status` / `git diff` and discard the unwanted ones selectively (e.g. `git restore <path>`)."
+      : "";
+    const message = `Job ${job.id} had already failed before it could be cancelled; the workspace was left untouched to avoid disturbing any edits you made since.${guidance}`;
     appendLogLine(job.logFile, message);
     upsertJob(workspaceRoot, { id: job.id, status: "failed", pid: null, agyPid: null, workspaceSnapshot: null });
     outputCommandResult(
@@ -1137,10 +1144,12 @@ async function handleCancel(argv) {
   appendLogLine(job.logFile, "Cancelled by user.");
 
   // The job is confirmed stopped and was still active (`running`/`queued`) — a
-  // genuine mid-flight cancel. Its whole working-tree delta belongs to the turn,
-  // so roll the tree back to the pre-task snapshot (preserving the user's pre-run
-  // changes and dropping only the turn's edits). Best effort: never let cleanup
-  // failure block the cancel itself.
+  // genuine mid-flight cancel. Roll the tree back to the pre-task snapshot
+  // (preserving the user's pre-run changes, dropping the turn's edits).
+  // restoreWorkspaceSnapshot first anchors a durable recovery ref so the reset
+  // is recoverable even if the tree also held concurrent (foreground+background
+  // write, or hand-edited) changes. Best effort: never let cleanup failure block
+  // the cancel itself.
   const snapshot = canonical.workspaceSnapshot ?? existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
   let rollback = null;
   if (snapshot) {
@@ -1152,6 +1161,12 @@ async function handleCancel(argv) {
           ? `Rolled back workspace to the pre-task snapshot${rollback.partial ? ` (partial: ${rollback.reason})` : "."}`
           : `Workspace left as-is: ${rollback.reason}`
       );
+      if (rollback.recoveryRef) {
+        appendLogLine(
+          job.logFile,
+          `Pre-rollback tracked tree backed up at ${rollback.recoveryRef} (${rollback.recoverySha}) — recover with \`git stash apply ${rollback.recoverySha}\` if the reset caught up any concurrent edits.`
+        );
+      }
     } catch (error) {
       rollback = { restored: false, reason: error instanceof Error ? error.message : String(error) };
       appendLogLine(job.logFile, `Workspace rollback failed: ${rollback.reason}`);
