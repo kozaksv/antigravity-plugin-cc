@@ -10,11 +10,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { makeTempDir } from "./helpers.mjs";
 import {
   ensureStateDir,
+  getConfig,
   listJobs,
   loadState,
   readJobFile,
   resolveJobFile,
   resolveJobLogFile,
+  resolveJobsDir,
   resolveStateDir,
   resolveStateFile,
   saveState,
@@ -23,6 +25,12 @@ import {
   writeJobFile
 } from "../plugins/antigravity/scripts/lib/state.mjs";
 import { acquireFileLockSync, reclaimStaleEntry } from "../plugins/antigravity/scripts/lib/file-lock.mjs";
+
+// Hermetic default: without this, tests that resolve state through the ambient
+// environment would write real directories under the developer's
+// ~/.local/state (the new non-tmp default). Resolver-specific tests override
+// or clear this per-test and restore it afterwards.
+process.env.CLAUDE_PLUGIN_DATA = makeTempDir("antigravity-state-tests-data-");
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "antigravity");
@@ -107,25 +115,99 @@ const RECLAIM_WORKER_SOURCE = `
   });
 `;
 
-test("resolveStateDir uses a temp-backed per-workspace directory", () => {
+test("resolveStateDir prefers XDG_STATE_HOME, then ~/.local/state — never the prunable tmpdir", () => {
   const workspace = makeTempDir();
-  // The fallback path only applies when CLAUDE_PLUGIN_DATA is unset; clear any
-  // ambient value so the test is deterministic regardless of the environment.
-  const previousPluginDataDir = process.env.CLAUDE_PLUGIN_DATA;
-  delete process.env.CLAUDE_PLUGIN_DATA;
+  const previous = {
+    pluginData: process.env.CLAUDE_PLUGIN_DATA,
+    xdgStateHome: process.env.XDG_STATE_HOME,
+    home: process.env.HOME
+  };
+  const xdgDir = makeTempDir("antigravity-xdg-state-");
+  const homeDir = makeTempDir("antigravity-home-");
 
   try {
-    const stateDir = resolveStateDir(workspace);
+    delete process.env.CLAUDE_PLUGIN_DATA;
 
-    assert.equal(stateDir.startsWith(os.tmpdir()), true);
+    process.env.XDG_STATE_HOME = xdgDir;
+    let stateDir = resolveStateDir(workspace);
+    assert.equal(stateDir.startsWith(path.join(xdgDir, "antigravity-companion")), true);
     assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
-    assert.match(stateDir, new RegExp(`^${os.tmpdir().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+
+    delete process.env.XDG_STATE_HOME;
+    process.env.HOME = homeDir;
+    stateDir = resolveStateDir(workspace);
+    assert.equal(stateDir.startsWith(path.join(homeDir, ".local", "state", "antigravity-companion")), true);
+    // Pre-1.0.2 regression guard: state in the world-shared, periodically
+    // pruned tmpdir root lost job history and the stopReviewGate toggle.
+    // (Compare against the legacy root specifically — the fake HOME above is
+    // itself a temp dir, so a bare startsWith(os.tmpdir()) would misfire.)
+    assert.equal(stateDir.startsWith(path.join(os.tmpdir(), "antigravity-companion")), false);
   } finally {
-    if (previousPluginDataDir == null) {
-      delete process.env.CLAUDE_PLUGIN_DATA;
-    } else {
-      process.env.CLAUDE_PLUGIN_DATA = previousPluginDataDir;
+    for (const [key, value] of [
+      ["CLAUDE_PLUGIN_DATA", previous.pluginData],
+      ["XDG_STATE_HOME", previous.xdgStateHome],
+      ["HOME", previous.home]
+    ]) {
+      if (value == null) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
     }
+  }
+});
+
+test("ensureStateDir pins the workspace state dir and jobs dir to 0700", () => {
+  const workspace = makeTempDir();
+  ensureStateDir(workspace);
+  for (const dir of [resolveStateDir(workspace), resolveJobsDir(workspace)]) {
+    assert.equal(
+      fs.statSync(dir).mode & 0o777,
+      0o700,
+      `${dir} must be owner-only: it holds prompts, results, and the gate config`
+    );
+  }
+});
+
+function seedLegacyState(workspace, contents) {
+  const legacyDir = path.join(os.tmpdir(), "antigravity-companion", path.basename(resolveStateDir(workspace)));
+  fs.mkdirSync(legacyDir, { recursive: true });
+  fs.writeFileSync(path.join(legacyDir, "state.json"), contents, "utf8");
+  return legacyDir;
+}
+
+test("legacy tmpdir CONFIG (stopReviewGate) is migrated once; legacy job records are not carried", () => {
+  const workspace = makeTempDir();
+  const legacyDir = seedLegacyState(
+    workspace,
+    `${JSON.stringify({
+      version: 1,
+      config: { stopReviewGate: true },
+      jobs: [{ id: "job-legacy", status: "running" }]
+    })}\n`
+  );
+
+  try {
+    // First state read of this workspace triggers the one-time migration.
+    assert.equal(getConfig(workspace).stopReviewGate, true, "the gate toggle must survive the upgrade");
+    // Job records stay behind: a pre-upgrade worker keeps writing them under
+    // /tmp with the old state module, so a copied record would freeze as
+    // "running" forever with no writer.
+    assert.deepEqual(listJobs(workspace), []);
+    assert.equal(fs.existsSync(resolveStateFile(workspace)), true);
+  } finally {
+    fs.rmSync(legacyDir, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt legacy state file is not trusted for the gate: defaults win, nothing throws", () => {
+  const workspace = makeTempDir();
+  const legacyDir = seedLegacyState(workspace, "{ definitely not json");
+
+  try {
+    assert.equal(getConfig(workspace).stopReviewGate, false);
+  } finally {
+    fs.rmSync(legacyDir, { recursive: true, force: true });
   }
 });
 

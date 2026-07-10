@@ -9,10 +9,20 @@ import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
-const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "antigravity-companion");
+const STATE_ROOT_BASENAME = "antigravity-companion";
+/**
+ * Pre-1.0.2 state root. `os.tmpdir()` is periodically pruned (macOS clears
+ * entries unused for ~3 days, every reboot clears it elsewhere) and is
+ * world-shared on multi-user hosts. Retained only as (a) the migration SOURCE
+ * for the one-time config carry-over below and (b) the absolute last-resort
+ * root when no home directory is resolvable at all.
+ */
+const LEGACY_STATE_ROOT_DIR = path.join(os.tmpdir(), STATE_ROOT_BASENAME);
 const STATE_FILE_NAME = "state.json";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+/** State holds prompts, results, and the review-gate config: owner-only. */
+const STATE_DIR_MODE = 0o700;
 
 function nowIso() {
   return new Date().toISOString();
@@ -28,7 +38,33 @@ function defaultState() {
   };
 }
 
-export function resolveStateDir(cwd) {
+/**
+ * State root resolution (first match wins):
+ *  1. `$CLAUDE_PLUGIN_DATA/state` — explicit override.
+ *  2. `$XDG_STATE_HOME/antigravity-companion` — XDG state dir, when absolute.
+ *  3. `~/.local/state/antigravity-companion` — the XDG default.
+ *  4. `<tmpdir>/antigravity-companion` — last resort (no resolvable home).
+ * Before 1.0.2 the root was ALWAYS (4); losing /tmp meant silently losing job
+ * history AND the `stopReviewGate` toggle after a reboot or tmp sweep.
+ */
+function resolveStateRootDir(env = process.env) {
+  const pluginDataDir = env[PLUGIN_DATA_ENV];
+  if (pluginDataDir) {
+    return path.join(pluginDataDir, "state");
+  }
+  const xdgStateHome = env.XDG_STATE_HOME;
+  if (xdgStateHome && path.isAbsolute(xdgStateHome)) {
+    return path.join(xdgStateHome, STATE_ROOT_BASENAME);
+  }
+  const home = env.HOME || os.homedir();
+  if (home) {
+    return path.join(home, ".local", "state", STATE_ROOT_BASENAME);
+  }
+  return LEGACY_STATE_ROOT_DIR;
+}
+
+/** Per-workspace state directory name: `<basename-slug>-<canonical-path-hash>`. */
+function stateDirName(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -40,9 +76,16 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return `${slug}-${hash}`;
+}
+
+export function resolveStateDir(cwd) {
+  return path.join(resolveStateRootDir(), stateDirName(cwd));
+}
+
+/** Where this workspace's state file lived before 1.0.2 (tmpdir root). */
+function resolveLegacyStateFile(cwd) {
+  return path.join(LEGACY_STATE_ROOT_DIR, stateDirName(cwd), STATE_FILE_NAME);
 }
 
 export function resolveStateFile(cwd) {
@@ -54,7 +97,21 @@ export function resolveJobsDir(cwd) {
 }
 
 export function ensureStateDir(cwd) {
-  fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
+  const stateDir = resolveStateDir(cwd);
+  const jobsDir = resolveJobsDir(cwd);
+  fs.mkdirSync(jobsDir, { recursive: true, mode: STATE_DIR_MODE });
+  // `mkdirSync`'s mode is umask-filtered and is not reliably applied to every
+  // intermediate component of a recursive create — the workspace-slug dir that
+  // holds `state.json` (prompts, results, gate config) could end up 0755 on a
+  // multi-user host. Pin both plugin-owned levels to 0700 explicitly; best
+  // effort so a foreign/pre-existing dir we cannot chmod never breaks state IO.
+  for (const dir of [stateDir, jobsDir]) {
+    try {
+      fs.chmodSync(dir, STATE_DIR_MODE);
+    } catch {
+      // not ours to chmod; leave as-is
+    }
+  }
 }
 
 function resolveStateLockFile(cwd) {
@@ -98,8 +155,12 @@ function atomicWriteFileSync(filePath, contents) {
  * to a fresh default state on a corrupt/unreadable file would let a
  * subsequent write clobber data that might still be recoverable, and would
  * hide the underlying problem from the caller.
+ *
+ * This unlocked variant is what every section that ALREADY holds `state.lock`
+ * must use (the lock is not reentrant); the public `loadState` additionally
+ * runs the one-time legacy-config migration, which takes that lock itself.
  */
-export function loadState(cwd) {
+function loadStateUnlocked(cwd) {
   const stateFile = resolveStateFile(cwd);
   let raw;
   try {
@@ -121,6 +182,81 @@ export function loadState(cwd) {
     },
     jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
   };
+}
+
+export function loadState(cwd) {
+  migrateLegacyConfigIfNeeded(cwd);
+  return loadStateUnlocked(cwd);
+}
+
+/** State dirs whose legacy-migration check already ran in this process. */
+const migrationCheckedStateDirs = new Set();
+
+/**
+ * One-time, config-only migration from the pre-1.0.2 tmpdir state root.
+ *
+ * Deliberately narrow (review escalation, 2026-07-10):
+ *  - CONFIG ONLY (`stopReviewGate` etc.) — the security-relevant bit that must
+ *    not silently reset to "gate off" on upgrade. Job records are NOT carried:
+ *    a still-running pre-upgrade worker keeps writing its job under /tmp with
+ *    the OLD state module, so a copied record would freeze as "running"
+ *    forever in the new root with no writer ever updating it.
+ *  - Runs entirely OUTSIDE any held `state.lock` (public entry points call it
+ *    BEFORE locking; locked sections use `loadStateUnlocked`), and takes the
+ *    lock itself only for the actual write, re-checking that no peer created
+ *    the new state file in the meantime.
+ *  - A corrupt legacy file cannot be trusted for a security toggle: warn
+ *    loudly on stderr (naming the gate) instead of guessing, then proceed
+ *    with defaults.
+ */
+function migrateLegacyConfigIfNeeded(cwd) {
+  const stateDir = resolveStateDir(cwd);
+  if (migrationCheckedStateDirs.has(stateDir)) {
+    return;
+  }
+  migrationCheckedStateDirs.add(stateDir);
+
+  const stateFile = resolveStateFile(cwd);
+  const legacyFile = resolveLegacyStateFile(cwd);
+  if (stateFile === legacyFile || fs.existsSync(stateFile)) {
+    return; // already on the legacy root (nothing to migrate to), or migrated
+  }
+
+  let raw;
+  try {
+    raw = fs.readFileSync(legacyFile, "utf8");
+  } catch {
+    return; // no legacy state — fresh workspace
+  }
+
+  let legacyConfig;
+  try {
+    const parsed = JSON.parse(raw);
+    legacyConfig = parsed && typeof parsed === "object" ? parsed.config : null;
+  } catch {
+    process.stderr.write(
+      `[antigravity] Legacy state at ${legacyFile} is corrupt; starting fresh. ` +
+        "If the stop-review gate was enabled there, re-enable it with `/antigravity:setup --enable-review-gate`.\n"
+    );
+    return;
+  }
+  if (!legacyConfig || typeof legacyConfig !== "object") {
+    return;
+  }
+
+  ensureStateDir(cwd);
+  withFileLock(resolveStateLockFile(cwd), () => {
+    if (fs.existsSync(stateFile)) {
+      return; // a peer migrated (or wrote fresh state) while we read the legacy file
+    }
+    saveStateUnlocked(cwd, {
+      ...defaultState(),
+      config: {
+        ...defaultState().config,
+        ...legacyConfig
+      }
+    });
+  });
 }
 
 function pruneJobs(jobs) {
@@ -216,7 +352,7 @@ function removeFileWithinIfExists(allowedDir, filePath) {
  * inside itself.
  */
 function saveStateUnlocked(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+  const previousJobs = loadStateUnlocked(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
@@ -251,21 +387,24 @@ function saveStateUnlocked(cwd, state) {
 
 /** Public single-shot write: takes `state.lock` exactly once around the write. */
 export function saveState(cwd, state) {
+  migrateLegacyConfigIfNeeded(cwd);
   ensureStateDir(cwd);
   return withFileLock(resolveStateLockFile(cwd), () => saveStateUnlocked(cwd, state));
 }
 
 /**
  * Read-modify-write `state.json` entirely under ONE `state.lock` acquisition:
- * `loadState` (fail-closed — throws on non-ENOENT errors, aborting the write
- * before `mutate`/`saveStateUnlocked` ever run) -> `mutate` ->
+ * `loadStateUnlocked` (fail-closed — throws on non-ENOENT errors, aborting
+ * the write before `mutate`/`saveStateUnlocked` ever run) -> `mutate` ->
  * `saveStateUnlocked` (no lock of its own). The lock is taken once here and
- * never re-entered, since the O_EXCL primitive is not reentrant.
+ * never re-entered, since the O_EXCL primitive is not reentrant; that is also
+ * why the legacy migration runs BEFORE the lock, never inside it.
  */
 export function updateState(cwd, mutate) {
+  migrateLegacyConfigIfNeeded(cwd);
   ensureStateDir(cwd);
   return withFileLock(resolveStateLockFile(cwd), () => {
-    const state = loadState(cwd);
+    const state = loadStateUnlocked(cwd);
     mutate(state);
     return saveStateUnlocked(cwd, state);
   });
