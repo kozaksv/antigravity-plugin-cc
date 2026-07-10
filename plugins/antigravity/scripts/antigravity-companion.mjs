@@ -1143,6 +1143,15 @@ async function handleCancel(argv) {
           ? `Rolled back workspace to the pre-task snapshot${rollback.partial ? ` (partial: ${rollback.reason})` : "."}`
           : `Workspace left as-is: ${rollback.reason}`
       );
+      // The rollback captured the pre-reset tree as a recovery point. Surface it
+      // so a user whose own edits were caught up in the reset (e.g. a late
+      // cancel of an already-failed job) can restore them.
+      if (rollback.recoveryStash) {
+        appendLogLine(
+          job.logFile,
+          `Pre-rollback working tree preserved as ${rollback.recoveryStash} — recover with \`git stash apply ${rollback.recoveryStash}\` if it held your own edits.`
+        );
+      }
     } catch (error) {
       rollback = { restored: false, reason: error instanceof Error ? error.message : String(error) };
       appendLogLine(job.logFile, `Workspace rollback failed: ${rollback.reason}`);

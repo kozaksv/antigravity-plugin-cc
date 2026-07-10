@@ -287,6 +287,32 @@ test("snapshotWorkspace + restoreWorkspaceSnapshot roll back a turn's tracked ed
   assert.doesNotMatch(restored, /half-applied-by-agy/);
 });
 
+test("restoreWorkspaceSnapshot captures a recovery point so a reset never loses tracked edits unrecoverably", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'committed';\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const snapshot = snapshotWorkspace(cwd);
+
+  // Simulate the scenario the fourth Codex pass flagged: a late cancel of an
+  // already-failed job whose index stayed `running`, with the USER's own edit
+  // present in the working tree at rollback time.
+  fs.writeFileSync(path.join(cwd, "app.js"), "export const value = 'users-later-work';\n");
+
+  const result = restoreWorkspaceSnapshot(snapshot);
+  assert.equal(result.restored, true);
+  // The reset happened (tree is back to committed) ...
+  assert.match(fs.readFileSync(path.join(cwd, "app.js"), "utf8"), /committed/);
+  // ... but the user's edit is NOT lost: it is recoverable from the returned
+  // stash commit, so the rollback is non-destructive.
+  assert.ok(result.recoveryStash, "a recovery stash SHA must be returned");
+  const show = run("git", ["show", `${result.recoveryStash}:app.js`], { cwd });
+  assert.equal(show.status, 0, show.stderr);
+  assert.match(show.stdout, /users-later-work/);
+});
+
 test("restoreWorkspaceSnapshot leaves the tree in place when HEAD moved (new commits)", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
