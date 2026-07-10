@@ -1,11 +1,11 @@
 ---
-description: Run a Antigravity code review against local git state
+description: Run an Antigravity code review against local git state
 argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
 
-Run a Antigravity review through the shared built-in reviewer.
+Run an Antigravity review through the shared built-in reviewer.
 
 Raw slash-command arguments:
 `$ARGUMENTS`
