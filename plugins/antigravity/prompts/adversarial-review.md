@@ -46,7 +46,9 @@ A finding should answer:
 </finding_bar>
 
 <structured_output_contract>
-Return only valid JSON matching the provided schema.
+Return only valid JSON matching the JSON Schema below. Every field, enum value,
+and numeric bound in the schema is enforced by an automated validator — output
+that does not conform is rejected, not repaired silently.
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
 Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
@@ -59,6 +61,9 @@ Write the summary like a terse ship/no-ship assessment, not a neutral recap.
 Output ONLY the JSON, wrapped between the result markers and nothing else:
 begin your reply with the exact line `===ANTIGRAVITY_RESULT_BEGIN===`, then the
 JSON object, then the exact line `===ANTIGRAVITY_RESULT_END===`.
+
+JSON Schema:
+{{OUTPUT_SCHEMA}}
 </structured_output_contract>
 
 <grounding_rules>

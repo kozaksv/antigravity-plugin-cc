@@ -20,6 +20,7 @@ import {
     runTurn
   } from "./lib/antigravity.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
+import { validateAgainstSchema } from "./lib/schema-validate.mjs";
 import {
   collectReviewContext,
   ensureGitRepository,
@@ -242,13 +243,136 @@ async function handleSetup(argv) {
 
 function buildAdversarialReviewPrompt(context, focusText) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
+  const schema = readOutputSchema(REVIEW_SCHEMA);
   return interpolateTemplate(template, {
     REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
-    REVIEW_INPUT: context.content
+    REVIEW_INPUT: context.content,
+    OUTPUT_SCHEMA: JSON.stringify(schema, null, 2)
   });
+}
+
+/** Build the (single, bounded) repair-turn prompt: validator errors + a
+ * reminder of the contract, deliberately NOT re-sending the full review
+ * context — the repair turn resumes the SAME conversation (see
+ * `runAdversarialReviewTurn`), so the model already has the diff in front of
+ * it and only needs to fix the JSON shape. */
+function buildReviewRepairPrompt(errors) {
+  return [
+    "Your previous reply did not validate against the required JSON Schema for this review.",
+    "Fix ONLY the JSON so it satisfies every field, enum, and numeric bound in that schema, and resend it.",
+    "Do not change your findings or verdict for any reason other than making the output schema-valid.",
+    "",
+    "Validation errors:",
+    ...errors.map((error) => `- ${error}`),
+    "",
+    "Output ONLY the corrected JSON, wrapped between the result markers exactly as instructed before:",
+    "begin your reply with the exact line `===ANTIGRAVITY_RESULT_BEGIN===`, then the JSON object, then the exact line `===ANTIGRAVITY_RESULT_END===`."
+  ].join("\n");
+}
+
+/**
+ * Validate a parsed review turn's output against the review-output schema.
+ * A turn that itself failed (non-zero status, or JSON that did not even
+ * parse) is treated as invalid with a descriptive error, never as "valid".
+ */
+function validateReviewTurnOutput(turnResult, parsed) {
+  if (turnResult.status !== 0) {
+    return { valid: false, errors: [turnResult.error?.message ?? "The Antigravity turn failed."] };
+  }
+  if (!parsed.parsed) {
+    return { valid: false, errors: [parsed.parseError ?? "Output was not valid JSON."] };
+  }
+  return validateAgainstSchema(parsed.parsed, readOutputSchema(REVIEW_SCHEMA));
+}
+
+/**
+ * Run the adversarial-review turn with fail-closed structured-output
+ * validation and a single bounded repair attempt.
+ *
+ * Fail-closed contract: any output that does not fully validate against
+ * `schemas/review-output.schema.json` is treated as a review ERROR, never as
+ * a silent success/approve — including after a failed repair attempt.
+ *
+ * Bounded repair: at most ONE additional turn is spent asking the model to
+ * fix a schema-invalid reply. That repair turn MUST resume the exact same
+ * conversation as the initial turn (via `resumeThreadId`), because a fresh
+ * conversation would have no diff context and could "fix" the JSON shape by
+ * fabricating an unfounded `approve` — turning fail-closed into a silent
+ * false approval. If the initial turn produced no conversation id to resume,
+ * repair is skipped entirely (fail-closed, not a blind retry in a fresh
+ * conversation).
+ */
+async function runAdversarialReviewTurn(context, focusText, request) {
+  const prompt = buildAdversarialReviewPrompt(context, focusText);
+  const turnOptions = {
+    model: request.model,
+    sandbox: "read-only",
+    // Adversarial review instructs `agy` to run read-only git inspection
+    // commands (self-collect), which would block on permission prompts headless.
+    skipPermissions: true,
+    onProgress: request.onProgress,
+    onSpawn: request.onAgyPid
+  };
+
+  const first = await runTurn(context.repoRoot, { prompt, ...turnOptions });
+  const firstParsed = parseStructuredOutput(first.finalMessage, {
+    status: first.status,
+    failureMessage: first.error?.message ?? first.stderr
+  });
+  const firstValidation = validateReviewTurnOutput(first, firstParsed);
+
+  if (firstValidation.valid) {
+    return { result: first, parsed: firstParsed, validation: firstValidation, repairAttempted: false, repaired: false };
+  }
+
+  // Only worth repairing if the turn itself came back (status 0) with *some*
+  // final message to fix — a hard turn failure (error/timeout) has nothing to
+  // repair.
+  if (first.status !== 0) {
+    return { result: first, parsed: firstParsed, validation: firstValidation, repairAttempted: false, repaired: false };
+  }
+
+  if (!first.threadId) {
+    return {
+      result: first,
+      parsed: firstParsed,
+      validation: {
+        valid: false,
+        errors: [
+          ...firstValidation.errors,
+          "Repair turn skipped: no conversation id was available to resume, so a blind retry in a fresh conversation (without diff context) was refused (fail-closed)."
+        ]
+      },
+      // No repair turn was actually spent (there was nothing safe to resume);
+      // `repairAttempted:false` reflects that no additional `agy` call happened.
+      repairAttempted: false,
+      repaired: false,
+      blockedNoThread: true
+    };
+  }
+
+  const repairPrompt = buildReviewRepairPrompt(firstValidation.errors);
+  const repairResult = await runTurn(context.repoRoot, {
+    prompt: repairPrompt,
+    resumeThreadId: first.threadId,
+    ...turnOptions
+  });
+  const repairParsed = parseStructuredOutput(repairResult.finalMessage, {
+    status: repairResult.status,
+    failureMessage: repairResult.error?.message ?? repairResult.stderr
+  });
+  const repairValidation = validateReviewTurnOutput(repairResult, repairParsed);
+
+  return {
+    result: repairResult,
+    parsed: repairParsed,
+    validation: repairValidation,
+    repairAttempted: true,
+    repaired: repairValidation.valid
+  };
 }
 
 function buildNativeReviewPrompt(context) {
@@ -410,22 +534,23 @@ async function executeReviewRun(request) {
   }
 
   const context = collectReviewContext(request.cwd, target);
-  const prompt = buildAdversarialReviewPrompt(context, focusText);
-  const result = await runTurn(context.repoRoot, {
-    prompt,
-    model: request.model,
-    sandbox: "read-only",
-    // Adversarial review instructs `agy` to run read-only git inspection
-    // commands (self-collect), which would block on permission prompts headless.
-    skipPermissions: true,
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress,
-    onSpawn: request.onAgyPid
-  });
-  const parsed = parseStructuredOutput(result.finalMessage, {
-    status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
-  });
+  const outcome = await runAdversarialReviewTurn(context, focusText, request);
+  const { result, parsed, validation, repairAttempted, repaired } = outcome;
+  const validationFailed = !validation.valid;
+
+  // Fail-closed: an output that does not fully validate against the review
+  // schema (even after the single bounded repair attempt) is NEVER surfaced
+  // as `parsed`/a success — it is folded into a parse-error-shaped result so
+  // both the JSON payload and the rendered text read as an explicit review
+  // error, not a silent (and possibly unfounded) approve.
+  const effectiveParsed = validationFailed
+    ? {
+        ...parsed,
+        parsed: null,
+        parseError: parsed.parseError ?? `Schema validation failed: ${validation.errors.join("; ")}`
+      }
+    : parsed;
+
   const payload = {
     review: reviewName,
     target,
@@ -441,23 +566,34 @@ async function executeReviewRun(request) {
       stdout: result.finalMessage,
       reasoning: result.reasoningSummary
     },
-    result: parsed.parsed,
+    result: validationFailed ? null : parsed.parsed,
     rawOutput: parsed.rawOutput,
-    parseError: parsed.parseError,
+    parseError: effectiveParsed.parseError,
+    validationErrors: validationFailed ? validation.errors : [],
+    repairAttempted,
+    repaired,
     reasoningSummary: result.reasoningSummary
   };
 
+  // A turn that succeeded (agy exit 0) but whose JSON failed schema
+  // validation must still fail the command: `result.status` alone is not
+  // fail-closed (agy can exit 0 with schema-invalid or unfounded-approve
+  // content), so validity gates the exit status too.
+  const exitStatus = result.status !== 0 ? result.status : validationFailed ? 1 : 0;
+
   return {
-    exitStatus: result.status,
+    exitStatus,
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
-    rendered: renderReviewResult(parsed, {
+    rendered: renderReviewResult(effectiveParsed, {
       reviewLabel: reviewName,
       targetLabel: context.target.label,
       reasoningSummary: result.reasoningSummary
     }),
-    summary: parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
+    summary: validationFailed
+      ? effectiveParsed.parseError
+      : parsed.parsed?.summary ?? parsed.parseError ?? firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
     jobTitle: `Antigravity ${reviewName}`,
     jobClass: "review",
     targetLabel: context.target.label

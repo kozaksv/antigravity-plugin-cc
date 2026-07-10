@@ -12,7 +12,7 @@ import {
   QUOTA_RESET_WINDOW,
   RESULT_BEGIN_MARKER
 } from "./fake-agy-fixture.mjs";
-import { isAlive, makeTempDir, run, waitForDeath } from "./helpers.mjs";
+import { isAlive, initGitRepo, makeTempDir, run, waitForDeath, writeExecutable } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "antigravity");
@@ -54,6 +54,173 @@ function readArgvInvocations(argvLog) {
     .split("\n")
     .filter(Boolean)
     .map((line) => JSON.parse(line));
+}
+
+/** A dirty git repo (uncommitted tracked change) so `resolveReviewTarget`'s
+ * "auto" scope picks working-tree mode without needing an explicit --scope. */
+function makeDirtyGitRepo() {
+  const cwd = makeTempDir("antigravity-review-cwd-");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v2');\n");
+  return cwd;
+}
+
+/**
+ * A fake `agy` whose structured-output reply for the Nth `-p` invocation is
+ * driven by an on-disk `replies` array (each call selects the next entry,
+ * clamped to the last once exhausted) — unlike `installFakeAgy`'s fixed
+ * "Reviewed: ..." reply, this lets tests script exactly what JSON (valid,
+ * schema-invalid, or non-JSON) `agy` returns turn by turn, to exercise
+ * schema validation and bounded repair. It otherwise mirrors the shared
+ * fixture: records the cwd -> conversation id mapping (unless
+ * `skipConversationId`) and a transcript, and logs argv to
+ * `AGY_FIXTURE_ARGV_LOG` so callers can assert on resume flags.
+ */
+function installStructuredFakeAgy(binDir, { conversationId = "conv-structured-0001" } = {}) {
+  const scriptPath = path.join(binDir, "agy");
+  const source = `#!/usr/bin/env node
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const VERSION = "1.0.10-fake-structured";
+const BEGIN = ${JSON.stringify(RESULT_BEGIN_MARKER)};
+const END = "===ANTIGRAVITY_RESULT_END===";
+const CONVERSATION_ID = ${JSON.stringify(conversationId)};
+
+const argv = process.argv.slice(2);
+
+if (process.env.AGY_FIXTURE_ARGV_LOG) {
+  try {
+    fs.appendFileSync(process.env.AGY_FIXTURE_ARGV_LOG, JSON.stringify(argv) + "\\n");
+  } catch {
+    // best effort
+  }
+}
+
+if (argv.includes("--version")) {
+  process.stdout.write(VERSION + "\\n");
+  process.exit(0);
+}
+
+function flagValue(name) {
+  const idx = argv.indexOf(name);
+  if (idx !== -1 && idx + 1 < argv.length) {
+    return argv[idx + 1];
+  }
+  return null;
+}
+
+const prompt = flagValue("-p");
+if (prompt == null) {
+  process.stderr.write("flag needs an argument: -p\\n");
+  process.exit(2);
+}
+
+// Each invocation is a fresh process, so the "which reply is this" call index
+// is persisted on disk.
+let callIndex = 0;
+const counterFile = process.env.AGY_STRUCTURED_COUNTER_FILE;
+if (counterFile) {
+  try {
+    callIndex = Number(fs.readFileSync(counterFile, "utf8").trim()) || 0;
+  } catch {
+    callIndex = 0;
+  }
+  try {
+    fs.writeFileSync(counterFile, String(callIndex + 1));
+  } catch {
+    // best effort
+  }
+}
+
+let replies = [""];
+try {
+  replies = JSON.parse(fs.readFileSync(process.env.AGY_STRUCTURED_REPLIES_FILE, "utf8"));
+} catch {
+  replies = [""];
+}
+const reply = replies[Math.min(callIndex, replies.length - 1)];
+
+const home = process.env.HOME || os.homedir();
+const agyHome = path.join(home, ".gemini", "antigravity-cli");
+
+if (process.env.AGY_STRUCTURED_SKIP_CONVERSATION !== "1") {
+  try {
+    const cacheDir = path.join(agyHome, "cache");
+    fs.mkdirSync(cacheDir, { recursive: true });
+    const cacheFile = path.join(cacheDir, "last_conversations.json");
+    let map = {};
+    try {
+      map = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    } catch {
+      map = {};
+    }
+    map[process.cwd()] = CONVERSATION_ID;
+    fs.writeFileSync(cacheFile, JSON.stringify(map, null, 2));
+  } catch {
+    // best effort
+  }
+
+  try {
+    const logsDir = path.join(agyHome, "brain", CONVERSATION_ID, ".system_generated", "logs");
+    fs.mkdirSync(logsDir, { recursive: true });
+    const lines = [
+      JSON.stringify({ step_index: 0, source: "USER_EXPLICIT", type: "USER_INPUT", status: "DONE", content: prompt }),
+      JSON.stringify({ step_index: 2, source: "MODEL", type: "PLANNER_RESPONSE", status: "DONE", content: reply })
+    ];
+    fs.writeFileSync(path.join(logsDir, "transcript.jsonl"), lines.join("\\n") + "\\n");
+  } catch {
+    // best effort
+  }
+}
+
+process.stdout.write(BEGIN + "\\n" + reply + "\\n" + END + "\\n");
+process.exit(0);
+`;
+  writeExecutable(scriptPath, source);
+  return scriptPath;
+}
+
+/** Build an isolated env for `installStructuredFakeAgy`: fake HOME (with a
+ * Google account so availability/auth probes succeed), argv log, a replies
+ * file, and a fresh call counter. */
+function withStructuredFakeAgy({ replies = [""], skipConversationId = false, conversationId } = {}) {
+  const binDir = makeTempDir("antigravity-structured-bin-");
+  installStructuredFakeAgy(binDir, { conversationId });
+
+  const fakeHome = makeTempDir("antigravity-structured-home-");
+  const geminiDir = path.join(fakeHome, ".gemini");
+  fs.mkdirSync(geminiDir, { recursive: true });
+  fs.writeFileSync(path.join(geminiDir, "google_accounts.json"), JSON.stringify({ active: "tester@example.com" }));
+
+  const argvLog = path.join(makeTempDir("antigravity-structured-argv-"), "argv.log");
+  const repliesFile = path.join(makeTempDir("antigravity-structured-replies-"), "replies.json");
+  fs.writeFileSync(repliesFile, JSON.stringify(replies));
+  const counterFile = path.join(makeTempDir("antigravity-structured-counter-"), "counter");
+  fs.writeFileSync(counterFile, "0");
+
+  const env = {
+    ...process.env,
+    HOME: fakeHome,
+    PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    AGY_FIXTURE_ARGV_LOG: argvLog,
+    AGY_STRUCTURED_REPLIES_FILE: repliesFile,
+    AGY_STRUCTURED_COUNTER_FILE: counterFile,
+    CLAUDE_PLUGIN_DATA: path.join(fakeHome, "plugin-data")
+  };
+  if (skipConversationId) {
+    env.AGY_STRUCTURED_SKIP_CONVERSATION = "1";
+  }
+
+  return { binDir, env, argvLog, counterFile };
+}
+
+function promptInvocations(argvLog) {
+  return readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
 }
 
 test("getAntigravityAvailability reports available when agy is on PATH", () => {
@@ -451,4 +618,155 @@ test("companion setup --json reports needs-attention when agy is missing", () =>
   assert.equal(report.ready, false);
   assert.equal(report.antigravity.available, false);
   assert.match(report.nextSteps.join("\n"), /install\.sh/);
+});
+
+// --- A1: adversarial-review structured-output contract, validation, and bounded repair ---
+
+const VALID_REVIEW_JSON = JSON.stringify({
+  verdict: "approve",
+  summary: "No material findings after adversarial review.",
+  findings: [],
+  next_steps: []
+});
+
+const SCHEMA_INVALID_REVIEW_JSON = JSON.stringify({
+  // "maybe" is not in the verdict enum (approve|needs-attention) — valid JSON,
+  // invalid against the schema.
+  verdict: "maybe",
+  summary: "Unsure.",
+  findings: [],
+  next_steps: []
+});
+
+const NON_JSON_REVIEW_TEXT = "I looked at the diff and it seems fine overall, no structured output here.";
+
+test("adversarial-review embeds the serialized review-output schema in the prompt sent to agy", () => {
+  const cwd = makeDirtyGitRepo();
+  const binDir = makeTempDir("antigravity-bin-");
+  installFakeAgy(binDir);
+  const argvLog = path.join(makeTempDir("antigravity-argv-"), "argv.log");
+  const env = buildEnv(binDir, { argvLog });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.ok(result.stdout, result.stderr);
+
+  const promptRuns = promptInvocations(argvLog);
+  assert.ok(promptRuns.length >= 1, "expected at least one -p invocation");
+  const initialPrompt = promptRuns[0][promptRuns[0].indexOf("-p") + 1];
+
+  // The {{OUTPUT_SCHEMA}} placeholder must be replaced with the actual
+  // serialized JSON Schema (top-level next_steps included), not left dangling.
+  assert.equal(initialPrompt.includes("{{OUTPUT_SCHEMA}}"), false);
+  assert.match(initialPrompt, /"verdict"/);
+  assert.match(initialPrompt, /"next_steps"/);
+  assert.match(initialPrompt, /"additionalProperties":\s*false/);
+});
+
+test("adversarial-review is fail-closed: schema-invalid output (twice) becomes an explicit review error, not success", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [NON_JSON_REVIEW_TEXT, NON_JSON_REVIEW_TEXT]
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 1, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.result, null);
+  assert.ok(payload.parseError, "expected a parseError explaining the failure");
+  assert.equal(payload.repairAttempted, true);
+  assert.equal(payload.repaired, false);
+
+  // Bounded repair: exactly one extra turn, never more.
+  assert.equal(promptInvocations(argvLog).length, 2);
+});
+
+test("adversarial-review repairs a schema-invalid reply on the bounded repair turn and succeeds", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [SCHEMA_INVALID_REVIEW_JSON, VALID_REVIEW_JSON]
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.repairAttempted, true);
+  assert.equal(payload.repaired, true);
+  assert.ok(payload.result, "expected a validated result object");
+  assert.equal(payload.result.verdict, "approve");
+
+  assert.equal(promptInvocations(argvLog).length, 2);
+});
+
+test("adversarial-review invalid twice hits the hard repair cap: exactly one repair turn, then an explicit error", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [SCHEMA_INVALID_REVIEW_JSON, SCHEMA_INVALID_REVIEW_JSON]
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 1, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.result, null);
+  assert.equal(payload.repairAttempted, true);
+  assert.equal(payload.repaired, false);
+  assert.match(payload.parseError, /verdict/);
+
+  // Exactly one repair turn was spent (2 total), not a retry loop.
+  assert.equal(promptInvocations(argvLog).length, 2);
+});
+
+test("adversarial-review repair turn resumes the SAME conversation (diff context), not a fresh one", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [SCHEMA_INVALID_REVIEW_JSON, VALID_REVIEW_JSON],
+    conversationId: "conv-repair-context-0001"
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 0, result.stdout || result.stderr);
+
+  const promptRuns = promptInvocations(argvLog);
+  assert.equal(promptRuns.length, 2);
+
+  const [initialArgv, repairArgv] = promptRuns;
+  // The initial turn starts a fresh conversation: no resume flag at all.
+  assert.equal(initialArgv.includes("-c"), false);
+  assert.equal(initialArgv.includes("--conversation"), false);
+
+  // The repair turn MUST resume the exact same conversation the initial turn
+  // established (fast path `-c`, since it is the cwd's most-recent) — a fresh
+  // conversation here would have no diff context and could "fix" the JSON
+  // shape into an unfounded approve.
+  assert.ok(
+    repairArgv.includes("-c") || repairArgv.includes("--conversation"),
+    `expected the repair turn to resume a conversation, got argv ${JSON.stringify(repairArgv)}`
+  );
+  if (repairArgv.includes("--conversation")) {
+    assert.equal(repairArgv[repairArgv.indexOf("--conversation") + 1], "conv-repair-context-0001");
+  }
+});
+
+test("adversarial-review skips repair (fail-closed, not a blind retry) when no conversation id is available to resume", () => {
+  const cwd = makeDirtyGitRepo();
+  const { env, argvLog } = withStructuredFakeAgy({
+    replies: [NON_JSON_REVIEW_TEXT],
+    skipConversationId: true
+  });
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--json"], { cwd, env });
+  assert.equal(result.status, 1, result.stdout || result.stderr);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.result, null);
+  // No repair turn was spent — the runner refused to retry blind in a fresh
+  // conversation, not "approve" it silently.
+  assert.equal(payload.repairAttempted, false);
+  assert.equal(payload.repaired, false);
+  assert.notEqual(payload.result?.verdict, "approve");
+
+  // Only the initial turn ran; no second `-p` invocation.
+  assert.equal(promptInvocations(argvLog).length, 1);
 });
