@@ -27,7 +27,10 @@
  *     same O_EXCL primitive) so exactly one process reclaims at a time, and
  *     by using a rename-then-reread-then-verify-token protocol so a reclaim
  *     that raced with a legitimate new holder aborts instead of destroying
- *     the new holder's lock.
+ *     the new holder's lock. A wedged reaper (its owner crashed mid-reap) is
+ *     itself force-cleared only via a token-verified rename CAS (never a bare
+ *     stat-then-unlink, which would let two racers both clear+recreate the
+ *     reaper and both enter the serialized section).
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -92,31 +95,136 @@ function parsePayload(raw) {
   }
 }
 
-function acquireReapLock(reapLockPath) {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+/**
+ * Is the reaper lock currently occupying `reapLockPath` wedged (its owner
+ * crashed mid-reap) and therefore safe to force-clear? A reaper whose recorded
+ * owner pid is still alive is NEVER wedged, regardless of age — its owner is
+ * genuinely reaping right now and must not be stolen. Only a dead-owner or an
+ * empty/unparseable reaper past the stale-age threshold is reclaimable.
+ */
+function reapLockIsWedged(raw, stat, killImpl) {
+  const parsed = parsePayload(raw);
+  if (parsed && Number.isFinite(Number(parsed.pid))) {
+    return !pidIsAlive(Number(parsed.pid), killImpl);
+  }
+  // Empty/unparseable (a live peer mid-create, or a legacy pid-only reaper):
+  // no pid to probe, so fall back to a pure age threshold. A freshly created
+  // reaper is recent and thus presumed a live peer's — never force-cleared.
+  return Date.now() - stat.mtimeMs >= REAP_LOCK_STALE_MS;
+}
+
+/**
+ * Force-clear a wedged reaper lock via a TOKEN-VERIFIED rename CAS.
+ *
+ * The bug this replaces: `stat -> unconditional unlink` lets two racers both
+ * observe the same stale reaper, both unlink+recreate it, and both fall through
+ * into the supposedly serialized reclaim section — breaking mutual exclusion.
+ *
+ * `renameSync` of the shared reaper path is atomic: exactly ONE racer can move
+ * a given reaper aside; every other racer observes ENOENT and simply retries
+ * the plain O_EXCL create (which, again, only one racer can win). After winning
+ * the rename we re-read the moved file and verify its token matches the wedged
+ * reaper we inspected — if a racing reclaimer recreated a FRESH reaper in the
+ * gap between our inspection and our rename, the token mismatches and we restore
+ * it rather than stranding its live owner.
+ *
+ * Returns true if the caller should retry its create (reaper cleared or already
+ * gone), false if the reaper is not clearable (a live/fresh reaper is held).
+ */
+function clearWedgedReapLock(reapLockPath, killImpl) {
+  let inspected;
+  try {
+    inspected = readRawAndStat(reapLockPath);
+  } catch {
+    return true; // vanished/unreadable between EEXIST and here; retry the create
+  }
+  if (!reapLockIsWedged(inspected.raw, inspected.stat, killImpl)) {
+    return false; // a live/fresh reaper: another reclaimer is genuinely active
+  }
+
+  const claimedPath = `${reapLockPath}.wedged.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.renameSync(reapLockPath, claimedPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return true; // another racer already moved it; retry the create
+    }
+    throw error;
+  }
+
+  let claimedRaw = null;
+  try {
+    claimedRaw = fs.readFileSync(claimedPath, "utf8");
+  } catch {
+    claimedRaw = null;
+  }
+  if (claimedRaw === inspected.raw) {
+    // We moved the exact wedged reaper we verified; drop it and let the caller
+    // race the fresh create.
     try {
-      return fs.openSync(reapLockPath, "wx");
+      fs.unlinkSync(claimedPath);
+    } catch {
+      // Already cleaned up by a peer; fine.
+    }
+    return true;
+  }
+
+  // Token mismatch: we displaced a reaper that a racing reclaimer recreated
+  // after our inspection. Put it back so its owner still holds it, and back off.
+  try {
+    fs.renameSync(claimedPath, reapLockPath);
+  } catch {
+    try {
+      fs.unlinkSync(claimedPath);
+    } catch {
+      // best effort
+    }
+  }
+  return false;
+}
+
+/**
+ * Acquire the reaper lock at `reapLockPath` (O_EXCL) so exactly one reclaimer
+ * proceeds. Writes a `{ pid, token }` payload so the token can be verified on
+ * release (and by `clearWedgedReapLock`). Returns the token on success, or null
+ * when another reclaimer holds a live/fresh reaper (caller must back off).
+ */
+function acquireReapLock(reapLockPath, killImpl) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let fd;
+    try {
+      fd = fs.openSync(reapLockPath, "wx");
     } catch (error) {
       if (error?.code !== "EEXIST") {
         throw error;
       }
-      if (attempt === 0) {
-        // A wedged reaper lock (its owner crashed mid-reap) would otherwise
-        // block reclaim forever. Force-clear it once it is clearly stale.
-        try {
-          const stat = fs.statSync(reapLockPath);
-          if (Date.now() - stat.mtimeMs >= REAP_LOCK_STALE_MS) {
-            fs.unlinkSync(reapLockPath);
-            continue;
-          }
-        } catch {
-          continue; // vanished or unreadable; just retry the create
-        }
+      if (attempt === 0 && clearWedgedReapLock(reapLockPath, killImpl)) {
+        continue; // cleared (or vanished); retry the create
       }
       return null; // busy: another reclaimer is active right now
     }
+    const token = makeToken(process.pid);
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }));
+    } finally {
+      fs.closeSync(fd);
+    }
+    return token;
   }
   return null;
+}
+
+/** Release a held reaper lock, but only if it still carries OUR token — never
+ * unlink a reaper a force-clear/recreate handed to a different holder. */
+function releaseReapLock(reapLockPath, token) {
+  try {
+    const parsed = parsePayload(fs.readFileSync(reapLockPath, "utf8"));
+    if (parsed?.token === token) {
+      fs.unlinkSync(reapLockPath);
+    }
+  } catch {
+    // Already gone; fine.
+  }
 }
 
 /**
@@ -134,17 +242,11 @@ function acquireReapLock(reapLockPath) {
  * expected races (busy reaper lock, entry vanished, token mismatch); other
  * errors (e.g. EACCES) propagate.
  */
-export function reclaimStaleEntry(entryPath, { isStale }) {
+export function reclaimStaleEntry(entryPath, { isStale, killImpl = process.kill.bind(process) } = {}) {
   const reapLockPath = `${entryPath}.reap`;
-  const reapFd = acquireReapLock(reapLockPath);
-  if (reapFd == null) {
+  const reapToken = acquireReapLock(reapLockPath, killImpl);
+  if (reapToken == null) {
     return { reclaimed: false, busy: true };
-  }
-
-  try {
-    fs.writeSync(reapFd, String(process.pid));
-  } finally {
-    fs.closeSync(reapFd);
   }
 
   try {
@@ -194,11 +296,7 @@ export function reclaimStaleEntry(entryPath, { isStale }) {
     }
     return { reclaimed: true };
   } finally {
-    try {
-      fs.unlinkSync(reapLockPath);
-    } catch {
-      // Already gone; fine.
-    }
+    releaseReapLock(reapLockPath, reapToken);
   }
 }
 
@@ -297,7 +395,8 @@ export function acquireFileLockSync(lockPath, options = {}) {
 
     if (isLockStale(info.raw, info.stat, { killImpl, emptyGraceMs, staleAfterMs })) {
       reclaimStaleEntry(lockPath, {
-        isStale: (raw, stat) => isLockStale(raw, stat, { killImpl, emptyGraceMs, staleAfterMs })
+        isStale: (raw, stat) => isLockStale(raw, stat, { killImpl, emptyGraceMs, staleAfterMs }),
+        killImpl
       });
       // Whatever the outcome (reclaimed / busy / aborted / already gone),
       // loop back around and retry the plain create.

@@ -364,7 +364,24 @@ async function runAdversarialReviewTurn(context, focusText, request) {
     status: repairResult.status,
     failureMessage: repairResult.error?.message ?? repairResult.stderr
   });
-  const repairValidation = validateReviewTurnOutput(repairResult, repairParsed);
+  let repairValidation = validateReviewTurnOutput(repairResult, repairParsed);
+
+  // Fail-closed guard: `agy` could not resume the original conversation (a bogus
+  // `--conversation <id>` prints a warning and then runs FRESH at exit 0). The
+  // repair prompt deliberately omits the diff (it assumes the same conversation
+  // still has it), so a fresh turn has no grounding and could "fix" the JSON by
+  // fabricating an unfounded `approve`. `runOneShot` surfaces this as
+  // `resumedFresh`; treat it as a hard repair failure regardless of schema
+  // validity — never a silent success.
+  if (repairResult.resumedFresh) {
+    repairValidation = {
+      valid: false,
+      errors: [
+        ...(repairValidation.errors ?? []),
+        "Repair turn failed: `agy` could not resume the original review conversation and ran as a fresh conversation without the diff context, so its output cannot be trusted (fail-closed)."
+      ]
+    };
+  }
 
   return {
     result: repairResult,

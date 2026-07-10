@@ -129,8 +129,33 @@ function pruneJobs(jobs) {
     .slice(0, MAX_JOBS);
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
+/**
+ * Is `targetPath` strictly inside `parentDir` (not the dir itself, not an
+ * escaping `..` traversal)? Resolved lexically via `path.relative`, so a
+ * `logFile`/`id` smuggled in via a pre-seeded `state.json` (its directory is
+ * world-writable by default on multi-user systems) cannot point the pruner at
+ * a path outside the plugin's own jobs directory.
+ */
+function isPathWithinDir(parentDir, targetPath) {
+  if (!targetPath || typeof targetPath !== "string") {
+    return false;
+  }
+  const rel = path.relative(path.resolve(parentDir), path.resolve(targetPath));
+  return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/**
+ * Delete `filePath` during job pruning ONLY when it resolves inside
+ * `allowedDir`. `filePath` (a job's `logFile`, or a per-job file whose name is
+ * derived from an attacker-influenced `id`) originates from `state.json`, which
+ * is not trusted: refuse to unlink anything outside the jobs directory so a
+ * poisoned state file cannot turn pruning into arbitrary file deletion.
+ */
+function removeFileWithinIfExists(allowedDir, filePath) {
+  if (!isPathWithinDir(allowedDir, filePath)) {
+    return; // outside the plugin's own jobs dir: never delete it
+  }
+  if (fs.existsSync(filePath)) {
     fs.unlinkSync(filePath);
   }
 }
@@ -155,13 +180,17 @@ function saveStateUnlocked(cwd, state) {
     jobs: nextJobs
   };
 
+  const jobsDir = resolveJobsDir(cwd);
   const retainedIds = new Set(nextJobs.map((job) => job.id));
   for (const job of previousJobs) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
+    // Both targets are gated to the jobs dir: `job.id` composes the per-job
+    // file name (a traversal id like `../../x` would otherwise escape) and
+    // `job.logFile` is an unverified absolute path straight from state.json.
+    removeFileWithinIfExists(jobsDir, resolveJobFile(cwd, job.id));
+    removeFileWithinIfExists(jobsDir, job.logFile);
   }
 
   atomicWriteFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
@@ -301,12 +330,6 @@ export function writeJobFile(cwd, jobId, payload) {
 
 export function readJobFile(jobFile) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
-  }
 }
 
 export function resolveJobLogFile(cwd, jobId) {

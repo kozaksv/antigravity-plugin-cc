@@ -2,6 +2,17 @@ import { spawnSync } from "node:child_process";
 import process from "node:process";
 
 export function runCommand(command, args = [], options = {}) {
+  // SECURITY: with `shell:true`, Windows joins the argv into a single command
+  // line and re-parses it through cmd.exe, so ANY argument containing shell
+  // metacharacters (e.g. a crafted git base-ref like `main & calc.exe`) would
+  // execute arbitrary commands. Standard binaries (git.exe, node.exe,
+  // taskkill.exe) run fine WITHOUT a shell, so we never enable one for them.
+  // The Windows shell is strictly opt-in per call (`options.windowsShell`) and
+  // only used for `.cmd`/`.bat` shims (npm, agy) that Node cannot spawn
+  // otherwise — and only ever with fixed, non-user arguments (see
+  // `binaryAvailable`'s version probes). It must never be turned on for any
+  // command that carries caller/user-controlled input.
+  const useShell = process.platform === "win32" && options.windowsShell === true;
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
@@ -9,7 +20,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: useShell,
     windowsHide: true
   });
 
@@ -36,7 +47,13 @@ export function runCommandChecked(command, args = [], options = {}) {
 }
 
 export function binaryAvailable(command, versionArgs = ["--version"], options = {}) {
-  const result = runCommand(command, versionArgs, options);
+  // Availability probes run a FIXED version flag with no caller/user input, so
+  // it is safe to let them use the Windows shell — that is what lets `.cmd`
+  // shims (npm, agy) resolve on Windows, where a bare spawn would ENOENT.
+  const result = runCommand(command, versionArgs, {
+    windowsShell: true,
+    ...options
+  });
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
     return { available: false, detail: "not found" };
   }
