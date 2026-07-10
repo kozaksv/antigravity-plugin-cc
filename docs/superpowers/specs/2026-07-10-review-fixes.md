@@ -27,7 +27,7 @@
 ### 3.1 Data model / стан (`lib/state.mjs`)
 
 - **Директорія стану (B4)**: ланцюг `CLAUDE_PLUGIN_DATA` → `XDG_STATE_HOME/antigravity-companion` → `~/.local/state/antigravity-companion`. Прибрати `os.tmpdir()`-фолбек. `mkdirSync` з `mode: 0o700`. Змінюється `resolveStateDir` (`FALLBACK_STATE_ROOT_DIR`). Міграції старого /tmp-стану НЕ робимо — job-и короткоживучі; зафіксувати в CHANGELOG.
-- **Блокування запису (B5)**: новий `state.lock` (O_EXCL, патерн job-slots) обгортає весь `updateState`/`saveState` (read-modify-write атомарний під локом). Захищає від конкурентних писарів: background-worker, `/antigravity:cancel`, session-хук.
+- **Блокування запису (B5)**: новий `state.lock` (O_EXCL, патерн job-slots) береться **лише на write-точках входу і без вкладення**. `updateState` виконує read→mutate→write повністю під одним локом, викликаючи всередині **приватний `saveStateUnlocked`** (без власного лока); публічний `saveState` (для прямих викликів) бере той самий лок один раз навколо свого write. Лок ніколи не вкладається сам у себе (O_EXCL нереентрантний — вкладення = самодедлок/EEXIST). Запис `state.json` — **атомарний write-and-rename**: серіалізувати в тимчасовий `state.json.<pid>.tmp` у тій самій директорії, `fs.renameSync` поверх цільового (rename атомарний на локальній FS). Прямий `fs.writeFileSync` у цільовий файл прибрати — інакше конкурентний читач (`loadState`) може прочитати обрізаний/порожній файл, впасти на `JSON.parse` і мовчки скотитись у `defaultState()`, стерши історію job-ів. Захищає від конкурентних писарів: background-worker, `/antigravity:cancel`, session-хук.
 - Формат `state.json` (jobs[]) **не змінюється** — лише механіка доступу.
 
 ### 3.2 API / argv- та prompt-контракт
@@ -40,7 +40,7 @@
 - **B2 — таймаути**: (а) хук читає `input.stop_hook_active === true` → logNote + allow (жодного повторного ревью в тому ж stop-циклі); (б) каскад: agy-turn 780s < spawnSync 840s < hook 900s. Хук передає ліміт у task через env `ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS` (runOneShot читає як fallback до `options.timeoutMs`). `hooks.json` Stop timeout лишається 900.
 - **B3 — SessionEnd teardown**: `hooks.json` SessionEnd timeout 5 → 60; у teardown `terminateProcessTree(pid, { graceMs: 2000 })`.
 - **B6 — self-collect untracked**: у гілці `includeDiff === false` (`git.mjs`) інлайнити лише список імен+розмірів (перші ~200, далі «…and N more»), без тіл файлів.
-- **B7 — Windows shell**: `lib/process.mjs` — прибрати `shell` повністю (git/taskkill/node/agy його не потребують). Для `binaryAvailable` на win32 — фолбек-проба `<cmd>.cmd` (напр. `npm.cmd`).
+- **B7 — Windows shell**: `lib/process.mjs` — на win32 **не прибирати shell**, а лише прибрати `process.env.SHELL`-оверрайд: `shell: process.platform === "win32"` (тобто `true` = cmd.exe на win32, `false` деінде). Причина: `git`, `npm`, а часто й обгортки agy лежать у PATH як `.cmd`/`.bat`, і без `shell:true` (або явного резолву розширення) `spawnSync` дасть ENOENT — зламає всі git-функції (снапшоти, дифи, коміти) на Windows. Поточний `process.env.SHELL || true` небезпечний тим, що POSIX-шлях у `SHELL` (напр. з git-bash) перехопить win32-спавни; фіксимо саме це, лишаючи cmd.exe-резолв `.cmd`/`.bat`/`.exe`. Для `binaryAvailable` на win32 — додатковий фолбек-проба `<cmd>.cmd` (напр. `npm.cmd`) як belt-and-suspenders.
 - **C1 — auth-probe cwd**: `getAntigravityAuthStatus` виконувати з одноразового `mkdtemp`-каталогу (не з workspace), щоб не перетирати `last_conversations.json[cwd]` і не ламати `--resume-last`.
 - **C8 — splitRawArgumentString бекслеші** (`lib/args.mjs`): бекслеш екранує лише наступні пробіл/лапку/бекслеш; перед іншими символами — literal (`C:\Users\x` виживає, `\"` досі екранує).
 - **C9 — `--timeout-ms 0`** (`antigravity-companion.mjs`): замінити `|| DEFAULT` на `Number.isFinite`-перевірку; 0 = миттєвий снапшот без очікування.
@@ -72,8 +72,8 @@
 ## 5. Ризики
 
 - **A2 (найбільший)**: `--sandbox` реально ламає self-collect → потрібен fallback-план і ручний проб ПЕРЕД релізом. Мітигація: escape env + fallback-гілка вже закладені.
-- **B5 локи**: неправильний stale-reclaim → або deadlock (лок ніколи не звільняється), або втрата захисту. Мітигація: точна копія перевіреного job-slots патерну + стрес-тест 15-20 паралельних писарів.
-- **B7 прибирання shell**: якщо якийсь виклик таки покладався на shell (glob/PATH-резолв) — регресія на win32. Мітигація: `.cmd`-фолбек для `binaryAvailable`; наявні тести не деградують.
+- **B5 локи**: неправильний stale-reclaim → або deadlock (лок ніколи не звільняється), або втрата захисту. Ще один клас — самодедлок від вкладеного лока (`updateState`→`saveState`): усунуто розділенням на залоканий вхід + приватний `saveStateUnlocked`. Мітигація: точна копія перевіреного job-slots патерну + атомарний write-and-rename + стрес-тест 15-20 паралельних писарів.
+- **B7 shell на win32**: зайве прибирання `shell` зламало б `.cmd`/`.bat`-резолв (git/npm) → ENOENT на win32. Мітигація: лишаємо `shell:true` на win32 (cmd.exe), прибираємо лише небезпечний `process.env.SHELL`-оверрайд; `.cmd`-фолбек для `binaryAvailable`; наявні тести не деградують.
 - **B1 effort**: звуження допустимих значень — breaking для тих, хто передавав інші рядки. Прийнятно (був no-op), але відзначити в CHANGELOG.
 - **bump-version**: розсинхрон 4 файлів версії → `check-version` як гейт наприкінці.
 
@@ -88,6 +88,6 @@
 
 - Нові можливості agy (`--add-dir`, мультируту).
 - Міграція старого /tmp-стану (job-и короткоживучі).
-- Повна Windows CI-матриця (лише прибирання `shell:true` + `.cmd`-фолбек).
+- Повна Windows CI-матриця (лише прибирання `process.env.SHELL`-оверрайду зі збереженням `shell:true` на win32 + `.cmd`-фолбек).
 - Зміна session-scoped моделі job-ів (лише чесні доки — C2).
 - Будь-які нові фічі поза списком знахідок.
