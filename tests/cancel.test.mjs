@@ -99,3 +99,73 @@ test("cancel does not roll back a job that already completed (its output is pres
     }
   }
 });
+
+/**
+ * Counterpart to the above (review-escalation P1, third Codex pass): a FAILED
+ * write turn retains its pre-run snapshot precisely so a cancel can roll back
+ * the partial edits it left behind. The terminal-status guard must therefore
+ * NOT treat `failed` like `completed` — cancel must still roll it back.
+ */
+test("cancel DOES roll back a failed write job's partial edits (failed != completed)", () => {
+  const repo = makeTempDir("antigravity-cancel-failed-repo-");
+  const dataDir = makeTempDir("antigravity-cancel-failed-data-");
+  const previousData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dataDir;
+
+  try {
+    initGitRepo(repo);
+    const file = path.join(repo, "output.txt");
+    fs.writeFileSync(file, "v1\n");
+    run("git", ["add", "output.txt"], { cwd: repo });
+    run("git", ["commit", "-m", "v1"], { cwd: repo });
+
+    // Snapshot of the clean pre-turn state (v1).
+    const snapshot = snapshotWorkspace(repo);
+    // The failed turn's HALF-APPLIED garbage edit (v2) that must be rolled back.
+    fs.writeFileSync(file, "v2\n");
+
+    const jobId = "task-cancel-failed";
+    // Canonical file: the turn FAILED but retained its snapshot (fix #6).
+    writeJobFile(repo, jobId, {
+      id: jobId,
+      status: "failed",
+      jobClass: "task",
+      write: true,
+      pid: DEAD_PID,
+      agyPid: DEAD_PID,
+      workspaceSnapshot: snapshot
+    });
+    // Index still shows it active, so cancel selects it (the race window).
+    saveState(repo, {
+      config: { stopReviewGate: false },
+      jobs: [
+        {
+          id: jobId,
+          status: "running",
+          jobClass: "task",
+          write: true,
+          pid: DEAD_PID,
+          agyPid: DEAD_PID,
+          workspaceSnapshot: snapshot,
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString()
+        }
+      ]
+    });
+
+    const result = run("node", [SCRIPT, "cancel", jobId, "--json"], {
+      cwd: repo,
+      env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir }
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+
+    // The failed turn's partial edit MUST be rolled back to the clean snapshot.
+    assert.equal(fs.readFileSync(file, "utf8"), "v1\n", "cancel must roll back a failed write turn's partial edits");
+  } finally {
+    if (previousData === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousData;
+    }
+  }
+});

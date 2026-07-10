@@ -1095,14 +1095,20 @@ async function handleCancel(argv) {
 
   // Every kill target is confirmed stopped, so the CANONICAL job status is now
   // settled — a dead worker cannot write again. Re-read it BEFORE touching the
-  // workspace: if the job actually FINISHED on its own (terminal) in the window
-  // between selection and this kill, its tracked edits are legitimate output,
-  // and rolling back the pre-run snapshot would ERASE completed work while
-  // falsely reporting "nothing to cancel" (review escalation P1). Only a job
-  // that is still non-terminal here is genuinely being cancelled mid-flight.
-  const terminalStatuses = new Set(["completed", "failed", "cancelled"]);
+  // workspace. A job that SUCCEEDED on its own in the window between selection
+  // and this kill has legitimate output: rolling back the pre-run snapshot
+  // would ERASE it while falsely reporting "nothing to cancel" (review
+  // escalation P1). So `completed` (and an already-`cancelled` job, whose
+  // snapshot was consumed by the earlier cancel) take the untouched path.
+  //
+  // `failed` is deliberately NOT here: a failed WRITE turn retains its pre-run
+  // snapshot precisely so a cancel can roll back the partial edits it left
+  // behind (see runTrackedJob). Treating it as "nothing to cancel" would strand
+  // that garbage in the workspace — so a failed job falls through to the
+  // rollback below (review escalation P1, third pass).
   const canonical = readStoredJob(workspaceRoot, job.id) ?? existing;
-  if (terminalStatuses.has(canonical.status)) {
+  const preserveWorkspaceStatuses = new Set(["completed", "cancelled"]);
+  if (preserveWorkspaceStatuses.has(canonical.status)) {
     const message = `Job ${job.id} already ${canonical.status} before it could be cancelled; nothing to cancel (workspace left untouched).`;
     appendLogLine(job.logFile, message);
     // Reconcile the index with the canonical status; leave the job file and the
@@ -1119,12 +1125,14 @@ async function handleCancel(argv) {
   appendLogLine(job.logFile, "Cancelled by user.");
 
   // Write tasks run `agy`'s black-box edits directly in the workspace, so a
-  // mid-turn kill can leave a half-applied patch. The job is confirmed stopped
-  // AND non-terminal (it did NOT complete), so its edits are an incomplete
-  // cancelled turn: roll the working tree back to the pre-task snapshot (which
-  // preserves the user's pre-run changes and only drops the turn's edits).
-  // Best effort: never let cleanup failure block the cancel itself.
-  const snapshot = existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
+  // mid-turn kill (or a failed turn) can leave a half-applied patch. The job is
+  // confirmed stopped and did NOT complete successfully — either still active
+  // (mid-flight cancel) or `failed` — so its edits are an incomplete turn: roll
+  // the working tree back to the pre-task snapshot (which preserves the user's
+  // pre-run changes and only drops the turn's edits). Prefer the freshest
+  // snapshot: a `failed` turn's is on the just-read canonical record. Best
+  // effort: never let cleanup failure block the cancel itself.
+  const snapshot = canonical.workspaceSnapshot ?? existing.workspaceSnapshot ?? job.workspaceSnapshot ?? null;
   let rollback = null;
   if (snapshot) {
     try {
