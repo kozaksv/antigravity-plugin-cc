@@ -106,26 +106,27 @@ function parseStopReviewOutput(rawOutput) {
 
 /**
  * `task --json`'s stdout is normally the structured payload (see
- * antigravity-companion.mjs's `executeTaskRun`), which carries a human-readable
- * `error.message` (e.g. QUOTA_EXHAUSTED) whenever the turn failed. Prefer that
- * over the raw stdout/stderr dump so a stop-gate block reason is actionable
- * instead of an opaque JSON blob; fall back to the raw dump when stdout is not
- * (or no longer) parseable JSON, or carries no usable error message.
+ * antigravity-companion.mjs's `executeTaskRun`), which carries a structured
+ * `error` ({ code, message }) whenever the turn failed. Prefer that over the
+ * raw stdout/stderr dump so a stop-gate outcome is actionable instead of an
+ * opaque JSON blob; fall back to the raw dump when stdout is not (or no
+ * longer) parseable JSON, or carries no usable error message.
  */
-function extractTaskFailureDetail(result) {
+function extractTaskFailure(result) {
   const rawStdout = String(result.stdout ?? "").trim();
   if (rawStdout) {
     try {
       const payload = JSON.parse(rawStdout);
       const message = String(payload?.error?.message ?? "").trim();
       if (message) {
-        return message;
+        return { code: payload?.error?.code ?? null, message };
       }
     } catch {
       // stdout was not JSON (or was cut off) — fall through to the raw dump.
     }
   }
-  return String(result.stderr || result.stdout || "").trim();
+  const fallback = String(result.stderr || result.stdout || "").trim();
+  return fallback ? { code: null, message: fallback } : null;
 }
 
 function runStopReview(cwd, input = {}) {
@@ -155,11 +156,21 @@ function runStopReview(cwd, input = {}) {
   }
 
   if (result.status !== 0) {
-    const detail = extractTaskFailureDetail(result);
+    const failure = extractTaskFailure(result);
+    // Non-retryable quota exhaustion must ALLOW the stop, loudly. Blocking here
+    // is an inescapable loop: the block reason cannot be "fixed", every new
+    // stop attempt re-runs the gate, fails on the same exhausted quota, and
+    // blocks again until the quota window resets (review-escalation P1).
+    if (failure?.code === "QUOTA_EXHAUSTED") {
+      return {
+        ok: true,
+        note: `Stop-review gate skipped: ${failure.message} A block could not recover while the quota is exhausted, so the session is allowed to end without the review.`
+      };
+    }
     return {
       ok: false,
-      reason: detail
-        ? `The stop-time Antigravity review task failed: ${detail}`
+      reason: failure
+        ? `The stop-time Antigravity review task failed: ${failure.message}`
         : "The stop-time Antigravity review task failed. Run /antigravity:review --wait manually or bypass the gate."
     };
   }
@@ -193,6 +204,19 @@ function main() {
     return;
   }
 
+  // Loop guard: when stop_hook_active is set, this stop attempt is itself the
+  // continuation of a PREVIOUS Stop-hook block in the same stop cycle. Running
+  // another full review here can loop the gate indefinitely (each block ->
+  // continuation -> new review -> block ...), burning an agy turn per lap.
+  // One review per stop cycle is the contract; allow this one through.
+  if (input.stop_hook_active === true) {
+    logNote(
+      "Stop-review gate: a prior block already ran this stop cycle (stop_hook_active); allowing the stop without another review."
+    );
+    logNote(runningTaskNote);
+    return;
+  }
+
   const setupNote = buildSetupNote(cwd);
   if (setupNote) {
     logNote(setupNote);
@@ -209,6 +233,7 @@ function main() {
     return;
   }
 
+  logNote(review.note);
   logNote(runningTaskNote);
 }
 

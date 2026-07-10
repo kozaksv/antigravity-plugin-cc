@@ -12,10 +12,10 @@ function read(relativePath) {
 }
 
 // D3: the external Bash timeout used by foreground blocks must strictly
-// exceed the full internal wrapper budget (initial turn + a possible A1
-// repair turn + overhead), so the wrapper self-timeouts before Claude
-// Code's Bash tool kills it. Bash's own timeout is capped at 600000ms, so
-// the internal per-turn budget must be reduced below that ceiling instead.
+// exceed the full internal wrapper budget (a review/task is a SINGLE agy
+// turn — there is no automatic repair turn), so the wrapper self-timeouts
+// before Claude Code's Bash tool kills it. Bash's own timeout is capped at
+// 600000ms, so the internal turn budget must be reduced below that ceiling.
 const BASH_TIMEOUT_CEILING_MS = 600000;
 
 function extractSection(source, startLabel, endLabel) {
@@ -39,11 +39,10 @@ function assertForegroundTimeoutIsSafe(section, label) {
   );
   const perTurnMs = Number(envMatch[1]);
   assert.ok(perTurnMs > 0, `${label}: per-turn timeout must be positive`);
-  // Worst case is one initial turn plus one A1 repair turn.
-  const worstCaseMs = perTurnMs * 2;
+  // Worst case is the single agy turn (no automatic repair turn exists).
   assert.ok(
-    worstCaseMs < BASH_TIMEOUT_CEILING_MS,
-    `${label}: worst-case internal budget (${worstCaseMs}ms) must stay strictly under the ${BASH_TIMEOUT_CEILING_MS}ms Bash ceiling`
+    perTurnMs < BASH_TIMEOUT_CEILING_MS,
+    `${label}: internal turn budget (${perTurnMs}ms) must stay strictly under the ${BASH_TIMEOUT_CEILING_MS}ms Bash ceiling`
   );
   assert.doesNotMatch(
     section,

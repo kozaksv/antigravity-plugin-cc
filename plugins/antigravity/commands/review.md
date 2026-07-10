@@ -40,9 +40,9 @@ Argument handling:
 - If the user needs custom review instructions or more adversarial framing, they should use `/antigravity:adversarial-review`.
 
 Foreground flow:
-- Run with the `Bash` tool using `timeout: 600000` (the 600s ceiling Claude Code allows for a foreground Bash call) and set `ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=270000` in the command environment. The external Bash `timeout` must always exceed the full internal wrapper budget (initial turn + a possible A1 repair turn + overhead) so the wrapper produces its own controlled timeout error before Bash kills it first. 270000ms per turn keeps the worst case (initial turn + one repair turn) at 540000ms, strictly under the 600000ms Bash ceiling. Do not rely on the wrapper's 900000ms default turn timeout here — it is larger than the Bash ceiling and would lose the race.
+- Run with the `Bash` tool using `timeout: 600000` (the 600s ceiling Claude Code allows for a foreground Bash call) and set `ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=540000` in the command environment. The review is a single `agy` turn; its internal turn budget must stay strictly under the external Bash `timeout` so the wrapper self-times-out (and reaps the detached `agy`) with a controlled error before Bash kills the wrapper. Do not rely on the wrapper's 900000ms default turn timeout here — it is larger than the Bash ceiling and would lose the race.
 ```bash
-ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=270000 node "${CLAUDE_PLUGIN_ROOT}/scripts/antigravity-companion.mjs" review "$ARGUMENTS"
+ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=540000 node "${CLAUDE_PLUGIN_ROOT}/scripts/antigravity-companion.mjs" review "$ARGUMENTS"
 ```
 - Return the command stdout verbatim, exactly as-is.
 - Do not paraphrase, summarize, or add commentary before or after it.
