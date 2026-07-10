@@ -5,6 +5,7 @@ import { isProbablyText } from "./fs.mjs";
 import { formatCommandFailure, runCommand, runCommandChecked } from "./process.mjs";
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
+const MAX_UNTRACKED_LISTED = 200;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 // Inline diffs are embedded in the prompt, which `agy -p` delivers via argv and
 // is capped at MAX_PROMPT_BYTES (128 KiB) in antigravity.mjs. Keep the inline
@@ -226,6 +227,39 @@ function formatUntrackedFile(cwd, relativePath) {
   return [`### ${relativePath}`, "```", buffer.toString("utf8").trimEnd(), "```"].join("\n");
 }
 
+/**
+ * Summarize an untracked file for self-collect (`includeDiff: false`) mode:
+ * name + size only, never file contents. Used instead of {@link formatUntrackedFile}
+ * when the caller must avoid embedding untracked file bodies (e.g. the lightweight
+ * adversarial review path), since untracked files are inherently unreviewed/
+ * unvetted content that should not be inlined into a prompt wholesale.
+ */
+function formatUntrackedFileSummaryLine(cwd, relativePath) {
+  const absolutePath = path.join(cwd, relativePath);
+  let stat;
+  try {
+    stat = fs.statSync(absolutePath);
+  } catch {
+    return `- ${relativePath} (unreadable)`;
+  }
+  if (stat.isDirectory()) {
+    return `- ${relativePath} (directory)`;
+  }
+  return `- ${relativePath} (${stat.size} bytes)`;
+}
+
+function formatUntrackedFileNameList(cwd, files) {
+  if (files.length === 0) {
+    return "";
+  }
+  const listed = files.slice(0, MAX_UNTRACKED_LISTED);
+  const lines = listed.map((file) => formatUntrackedFileSummaryLine(cwd, file));
+  if (files.length > MAX_UNTRACKED_LISTED) {
+    lines.push(`…and ${files.length - MAX_UNTRACKED_LISTED} more`);
+  }
+  return lines.join("\n");
+}
+
 function collectWorkingTreeContext(cwd, state, options = {}) {
   const includeDiff = options.includeDiff !== false;
   const status = gitChecked(cwd, ["status", "--short", "--untracked-files=all"]).stdout.trim();
@@ -245,7 +279,7 @@ function collectWorkingTreeContext(cwd, state, options = {}) {
   } else {
     const stagedStat = gitChecked(cwd, ["diff", "--shortstat", "--cached"]).stdout.trim();
     const unstagedStat = gitChecked(cwd, ["diff", "--shortstat"]).stdout.trim();
-    const untrackedBody = state.untracked.map((file) => formatUntrackedFile(cwd, file)).join("\n\n");
+    const untrackedBody = formatUntrackedFileNameList(cwd, state.untracked);
     parts = [
       formatSection("Git Status", status),
       formatSection("Staged Diff Stat", stagedStat),

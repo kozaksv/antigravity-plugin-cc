@@ -11,6 +11,11 @@ import {
 } from "../plugins/antigravity/scripts/lib/git.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
+function extractSection(content, title) {
+  const match = content.match(new RegExp(`## ${title}\\n\\n([\\s\\S]*?)(?:\\n## |$)`));
+  return match ? match[1].trim() : "";
+}
+
 test("resolveReviewTarget prefers working tree when repo is dirty", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
@@ -165,7 +170,7 @@ test("collectReviewContext falls back to lightweight context for oversized singl
   assert.match(context.content, /## Changed Files/);
 });
 
-test("collectReviewContext keeps untracked file content in lightweight working tree context", () => {
+test("collectReviewContext lists untracked names+sizes (not bodies) in lightweight working tree context", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
   for (const name of ["a.js", "b.js"]) {
@@ -175,7 +180,8 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   run("git", ["commit", "-m", "init"], { cwd });
   fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "TRACKED_MARKER_A";\n');
   fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "TRACKED_MARKER_B";\n');
-  fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
+  const untrackedContent = 'export const value = "UNTRACKED_RISK_MARKER";\n';
+  fs.writeFileSync(path.join(cwd, "new-risk.js"), untrackedContent);
 
   const target = resolveReviewTarget(cwd, {});
   const context = collectReviewContext(cwd, target);
@@ -183,6 +189,74 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   assert.equal(context.inputMode, "self-collect");
   assert.equal(context.fileCount, 3);
   assert.doesNotMatch(context.content, /TRACKED_MARKER_[AB]/);
+  assert.match(context.content, /## Untracked Files/);
+  // Name + size are inlined...
+  assert.match(context.content, new RegExp(`new-risk\\.js \\(${Buffer.byteLength(untrackedContent, "utf8")} bytes\\)`));
+  // ...but the file body is never inlined in self-collect mode.
+  assert.doesNotMatch(context.content, /UNTRACKED_RISK_MARKER/);
+});
+
+test("collectReviewContext caps self-collect untracked listing at 200 and reports the remainder", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js", "c.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "SELF_COLLECT_MARKER_A";\n');
+  fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "SELF_COLLECT_MARKER_B";\n');
+  fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
+
+  const untrackedCount = 205;
+  for (let i = 0; i < untrackedCount; i += 1) {
+    fs.writeFileSync(path.join(cwd, `untracked-${String(i).padStart(4, "0")}.txt`), `body ${i}`);
+  }
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+  const untrackedSection = extractSection(context.content, "Untracked Files");
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.match(untrackedSection, /untracked-0000\.txt \(\d+ bytes\)/);
+  assert.match(untrackedSection, /untracked-0199\.txt \(\d+ bytes\)/);
+  assert.doesNotMatch(untrackedSection, /untracked-0200\.txt/);
+  assert.match(untrackedSection, new RegExp(`…and ${untrackedCount - 200} more`));
+});
+
+test("collectReviewContext self-collect untracked section does not break with zero untracked files", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js", "c.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js", "c.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "a.js"), 'export const value = "SELF_COLLECT_MARKER_A";\n');
+  fs.writeFileSync(path.join(cwd, "b.js"), 'export const value = "SELF_COLLECT_MARKER_B";\n');
+  fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.inputMode, "self-collect");
+  assert.match(context.content, /## Untracked Files\n\n\(none\)/);
+});
+
+test("collectReviewContext keeps untracked file bodies inline in inline-diff mode (regression control)", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  for (const name of ["a.js", "b.js"]) {
+    fs.writeFileSync(path.join(cwd, name), `export const value = "${name}-v1";\n`);
+  }
+  run("git", ["add", "a.js", "b.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+  fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
+
+  const target = resolveReviewTarget(cwd, {});
+  const context = collectReviewContext(cwd, target, { includeDiff: true });
+
+  assert.equal(context.inputMode, "inline-diff");
   assert.match(context.content, /## Untracked Files/);
   assert.match(context.content, /UNTRACKED_RISK_MARKER/);
 });
