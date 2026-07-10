@@ -309,7 +309,9 @@ async function runAdversarialReviewTurn(context, focusText, request) {
   const prompt = buildAdversarialReviewPrompt(context, focusText);
   const turnOptions = {
     model: request.model,
-    sandbox: "read-only",
+    // Read-only review turn: run under agy's own `--sandbox` terminal
+    // restrictions (see buildAgyArgs; ANTIGRAVITY_COMPANION_NO_SANDBOX=1 opts out).
+    sandbox: true,
     // Adversarial review instructs `agy` to run read-only git inspection
     // commands (self-collect), which would block on permission prompts headless.
     skipPermissions: true,
@@ -659,7 +661,9 @@ async function executeTaskRun(request) {
     defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
     model: request.model,
     write: request.write,
-    sandbox: request.write ? "workspace-write" : "read-only",
+    // `task --write` edits the workspace by design, so it never gets
+    // `--sandbox`; a `task` without `--write` is read-only and runs sandboxed.
+    sandbox: !request.write,
     // Rescue tasks invoke tools/git headlessly; skip the permission prompt so a
     // read-only task does not stall waiting for an answer that can never come.
     skipPermissions: true,

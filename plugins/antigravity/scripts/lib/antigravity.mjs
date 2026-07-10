@@ -347,6 +347,21 @@ function buildAgyArgs(prompt, options = {}) {
     args.push("--dangerously-skip-permissions");
   }
 
+  // Non-write runs (review, adversarial-review, `task` without `--write`) pass
+  // `options.sandbox = true` so `agy` runs under its own terminal-restriction
+  // sandbox (docs/agy-cli.md: `--sandbox`) even though we already had to grant
+  // `--dangerously-skip-permissions` above (self-collect review still needs to
+  // run read-only git inspection commands headlessly). `task --write` runs are
+  // expected to edit the workspace, so they never set `options.sandbox` and
+  // never get this flag. Escape hatch for environments where `--sandbox`
+  // interferes with a run: `ANTIGRAVITY_COMPANION_NO_SANDBOX=1` (validated
+  // strict-equality parse — any other value is ignored, not truthy-coerced).
+  const sandboxEnv = options.env ?? process.env;
+  const sandboxDisabled = sandboxEnv.ANTIGRAVITY_COMPANION_NO_SANDBOX === "1";
+  if (options.sandbox && !sandboxDisabled) {
+    args.push("--sandbox");
+  }
+
   // Routes agy's verbose Go log to a path we control, so a turn that produces
   // no usable stdout (e.g. RESOURCE_EXHAUSTED, which agy never surfaces on
   // stdout/stderr/exit-code) can still be diagnosed after the fact.
@@ -658,10 +673,8 @@ async function runOneShot(cwd, options = {}) {
     // Headless runs cannot answer permission prompts. Write runs obviously need
     // it; read-only review runs also instruct agy to run git inspection commands
     // (self-collect), so they must skip permissions too or they hang.
-    skipPermissions:
-      options.write ||
-      options.sandbox === "workspace-write" ||
-      options.skipPermissions === true,
+    skipPermissions: options.write || options.skipPermissions === true,
+    sandbox: options.sandbox === true,
     resumeConversationId,
     resumeWithContinue,
     timeoutMs: options.timeoutMs,
@@ -799,6 +812,9 @@ export async function runReview(cwd, options = {}) {
     // inspection commands. In headless `agy -p` those would block on a permission
     // prompt until the external timeout, so skip permissions for the review.
     skipPermissions: true,
+    // `runReview` is always a read-only native review (never `--write`), so it
+    // always runs under `--sandbox` (see buildAgyArgs); no caller opt-out.
+    sandbox: true,
     onProgress: options.onProgress,
     onSpawn: options.onSpawn,
     env: options.env,

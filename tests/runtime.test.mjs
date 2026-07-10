@@ -532,6 +532,93 @@ test("runReview returns the model review text", async () => {
   assert.equal(result.sourceThreadId, result.threadId);
 });
 
+// A2: non-write runs (review, adversarial-review, `task` without `--write`)
+// pass `--sandbox` to `agy`; `task --write` never does. See docs/agy-cli.md
+// for `--sandbox` and buildAgyArgs (antigravity.mjs) for the argv assembly.
+test("runReview (native review) argv includes --sandbox", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const result = await runReview(cwd, { prompt: "Review the diff", env });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  assert.ok(promptRuns[0].includes("--sandbox"), "review argv should include --sandbox");
+});
+
+test("runTurn for adversarial-review (sandbox:true, no write) argv includes --sandbox", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const result = await runTurn(cwd, {
+    prompt: "Adversarial review the diff",
+    env,
+    sandbox: true,
+    skipPermissions: true
+  });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  assert.ok(promptRuns[0].includes("--sandbox"), "adversarial-review argv should include --sandbox");
+});
+
+test("runTurn for task --write argv does NOT include --sandbox", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const result = await runTurn(cwd, {
+    prompt: "Fix the bug",
+    env,
+    write: true,
+    sandbox: false
+  });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  assert.ok(!promptRuns[0].includes("--sandbox"), "task --write argv should NOT include --sandbox");
+});
+
+test("ANTIGRAVITY_COMPANION_NO_SANDBOX=1 disables --sandbox even for review", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const noSandboxEnv = { ...env, ANTIGRAVITY_COMPANION_NO_SANDBOX: "1" };
+  const result = await runReview(cwd, { prompt: "Review the diff", env: noSandboxEnv });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  assert.ok(
+    !promptRuns[0].includes("--sandbox"),
+    "ANTIGRAVITY_COMPANION_NO_SANDBOX=1 should suppress --sandbox"
+  );
+});
+
+test("ANTIGRAVITY_COMPANION_NO_SANDBOX with a non-'1' value does NOT disable --sandbox", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const looseEnv = { ...env, ANTIGRAVITY_COMPANION_NO_SANDBOX: "true" };
+  const result = await runReview(cwd, { prompt: "Review the diff", env: looseEnv });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  assert.ok(
+    promptRuns[0].includes("--sandbox"),
+    "only the exact string '1' should disable --sandbox"
+  );
+});
+
+test("self-collect review (includeDiff===false) under sandbox still builds correct argv", async () => {
+  // Self-collect review instructs `agy` to run its own read-only git inspection
+  // commands, so it needs BOTH `--sandbox` (non-write hardening) AND
+  // `--dangerously-skip-permissions` (so those headless git commands don't
+  // stall on an interactive permission prompt).
+  const { env, cwd, argvLog } = withFakeAgy();
+  const selfCollectPrompt =
+    "Inspect the working tree yourself with read-only git commands before reviewing.";
+  const result = await runReview(cwd, { prompt: selfCollectPrompt, env });
+  assert.equal(result.status, 0);
+  const promptRuns = readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
+  assert.equal(promptRuns.length, 1);
+  const argv = promptRuns[0];
+  assert.ok(argv.includes("--sandbox"), "self-collect review argv should include --sandbox");
+  assert.ok(
+    argv.includes("--dangerously-skip-permissions"),
+    "self-collect review argv should still skip permissions so headless git inspection does not hang"
+  );
+  assert.equal(argv[argv.indexOf("-p") + 1], selfCollectPrompt);
+});
+
 test("assertPromptWithinLimit accepts prompts up to the cap and rejects oversized ones", () => {
   assert.equal(assertPromptWithinLimit("small prompt"), Buffer.byteLength("small prompt"));
   // Exactly at the limit is allowed.
