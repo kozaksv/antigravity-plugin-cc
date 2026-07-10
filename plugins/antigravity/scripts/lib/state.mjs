@@ -145,19 +145,67 @@ function isPathWithinDir(parentDir, targetPath) {
 }
 
 /**
+ * A job id COMPOSES a per-job file path (`jobs/<id>.json`, `jobs/<id>.log`), so
+ * it must be a single safe path segment. Any path separator, `.`, or `..` would
+ * let a poisoned `state.json` (its directory is world-writable by default on
+ * multi-user systems) compose a path that leaves the jobs dir — e.g. an id like
+ * `link/target` combined with a pre-planted symlink `jobs/link -> /victim` would
+ * turn pruning into arbitrary file deletion via that symlinked component. Refuse
+ * anything that is not a conservative `[A-Za-z0-9._-]` basename.
+ */
+const SAFE_JOB_ID = /^[A-Za-z0-9._-]+$/;
+function isSafeJobId(id) {
+  return (
+    typeof id === "string" &&
+    id.length > 0 &&
+    id.length <= 200 &&
+    id !== "." &&
+    id !== ".." &&
+    SAFE_JOB_ID.test(id)
+  );
+}
+
+/**
  * Delete `filePath` during job pruning ONLY when it resolves inside
  * `allowedDir`. `filePath` (a job's `logFile`, or a per-job file whose name is
  * derived from an attacker-influenced `id`) originates from `state.json`, which
  * is not trusted: refuse to unlink anything outside the jobs directory so a
  * poisoned state file cannot turn pruning into arbitrary file deletion.
+ *
+ * Lexical containment (`path.relative`) alone is NOT sufficient: a symlinked
+ * component planted inside the jobs dir (`jobs/link -> /victim`) passes the
+ * lexical check yet redirects the `unlinkSync` outside the dir. So additionally
+ * resolve the REAL parent directory and require the target to be a DIRECT child
+ * of the REAL jobs dir, and to be a regular file (never a symlink/dir) — this
+ * closes the symlink-traversal deletion vector while still deleting every
+ * legitimate `jobs/<id>.json` / `jobs/<id>.log` (both are always direct file
+ * children of the jobs dir).
  */
 function removeFileWithinIfExists(allowedDir, filePath) {
   if (!isPathWithinDir(allowedDir, filePath)) {
-    return; // outside the plugin's own jobs dir: never delete it
+    return; // outside the plugin's own jobs dir (lexically): never delete it
   }
-  if (fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
+  let realAllowedDir;
+  let realParent;
+  try {
+    realAllowedDir = fs.realpathSync(allowedDir);
+    realParent = fs.realpathSync(path.dirname(filePath));
+  } catch {
+    return; // unresolvable (missing dir / broken symlink): nothing safe to delete
   }
+  if (realParent !== realAllowedDir) {
+    return; // parent escaped the jobs dir through a symlinked component
+  }
+  let entryStat;
+  try {
+    entryStat = fs.lstatSync(filePath);
+  } catch {
+    return; // already gone
+  }
+  if (!entryStat.isFile()) {
+    return; // symlink/dir/other: refuse — unlinking could be redirected elsewhere
+  }
+  fs.unlinkSync(filePath);
 }
 
 /**
@@ -186,10 +234,14 @@ function saveStateUnlocked(cwd, state) {
     if (retainedIds.has(job.id)) {
       continue;
     }
-    // Both targets are gated to the jobs dir: `job.id` composes the per-job
-    // file name (a traversal id like `../../x` would otherwise escape) and
-    // `job.logFile` is an unverified absolute path straight from state.json.
-    removeFileWithinIfExists(jobsDir, resolveJobFile(cwd, job.id));
+    // `job.id` composes the per-job file name: only compose+delete it when the
+    // id is a safe basename, so a traversal/symlink id (`../../x`, `link/target`)
+    // is never turned into a path in the first place. `job.logFile` is an
+    // unverified absolute path straight from state.json. Both deletions are then
+    // re-validated by `removeFileWithinIfExists` against the REAL jobs dir.
+    if (isSafeJobId(job.id)) {
+      removeFileWithinIfExists(jobsDir, resolveJobFile(cwd, job.id));
+    }
     removeFileWithinIfExists(jobsDir, job.logFile);
   }
 

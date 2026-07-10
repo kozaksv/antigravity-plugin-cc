@@ -282,11 +282,32 @@ export function reclaimStaleEntry(entryPath, { isStale, killImpl = process.kill.
     }
 
     if (postRaw !== current.raw) {
-      // Content changed between our pre-check read and the rename: something
-      // else touched this entry concurrently. Abort rather than guess; leave
-      // the renamed copy in place instead of unlinking anything we are not
-      // sure about.
-      return { reclaimed: false, aborted: true, deadPath };
+      // Content changed between our pre-check read and the rename: the entry was
+      // NOT actually stale (typically a mid-create holder that finished writing
+      // its payload in the gap between our read and our rename). We have already
+      // moved that live holder's lock file aside — and leaving `entryPath`
+      // ABSENT would let a fresh `tryCreateLock` (O_EXCL) win it WHILE the
+      // original holder still lives (its fd points at the moved inode), i.e. two
+      // concurrent holders and broken mutual exclusion. Restore the lock to its
+      // canonical path so exactly one holder remains visible. Use `link`+`unlink`
+      // (never `rename`, which clobbers): on `EEXIST` a racer already created a
+      // fresh lock at `entryPath` in the gap, so drop our now-superseded copy
+      // rather than smash the live one.
+      try {
+        fs.linkSync(deadPath, entryPath);
+        fs.unlinkSync(deadPath);
+      } catch (restoreError) {
+        if (restoreError?.code === "EEXIST") {
+          try {
+            fs.unlinkSync(deadPath);
+          } catch {
+            // best effort
+          }
+        } else {
+          throw restoreError;
+        }
+      }
+      return { reclaimed: false, aborted: true };
     }
 
     try {
@@ -394,13 +415,21 @@ export function acquireFileLockSync(lockPath, options = {}) {
     }
 
     if (isLockStale(info.raw, info.stat, { killImpl, emptyGraceMs, staleAfterMs })) {
-      reclaimStaleEntry(lockPath, {
+      const outcome = reclaimStaleEntry(lockPath, {
         isStale: (raw, stat) => isLockStale(raw, stat, { killImpl, emptyGraceMs, staleAfterMs }),
         killImpl
       });
-      // Whatever the outcome (reclaimed / busy / aborted / already gone),
-      // loop back around and retry the plain create.
-      continue;
+      // Only a successful reclaim (or an entry that vanished) actually frees the
+      // path, so only those justify retrying the create IMMEDIATELY. A `busy`
+      // reaper lock or an `aborted` content-mismatch means the lock is still
+      // held — fall through to the deadline check and the `sleepSync` poll
+      // backoff below. `continue`-ing unconditionally here (the previous
+      // behavior) skipped BOTH the timeout check and the poll delay, so under
+      // sustained contention (a busy reaper or a repeatedly-aborting reclaim)
+      // this spun at 100% CPU and could bypass `timeoutMs` indefinitely.
+      if (outcome.reclaimed || outcome.gone) {
+        continue;
+      }
     }
 
     if (Date.now() >= deadline) {

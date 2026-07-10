@@ -691,6 +691,22 @@ async function runOneShot(cwd, options = {}) {
     );
   }
 
+  // Resume-target verification (fail-closed). `agy` records the conversation it
+  // ACTUALLY operated on in `last_conversations.json`; after a resume turn that
+  // recorded id must equal the id we asked to resume. If it does not, the turn
+  // ran against the WRONG conversation — the classic case being the `-c`
+  // ("continue most-recent") fast path: we picked `-c` because the cache showed
+  // `requestedResumeId` was most-recent, but between that check and the spawn a
+  // concurrent run in the SAME cwd made a DIFFERENT conversation most-recent, so
+  // `-c` continued theirs, not ours. `resumedFresh` only caught the bogus
+  // explicit-`--conversation` case, so a schema-valid answer produced against an
+  // unrelated conversation would have been silently accepted, breaking the
+  // fail-closed invariant. Treat any resume-target mismatch exactly like a fresh
+  // (ungrounded) run so callers reject it. Only asserted for resume turns
+  // (`requestedResumeId` set); initial turns never set it.
+  const resumeTargetMismatch =
+    Boolean(requestedResumeId) && recordedConversationId !== requestedResumeId;
+
   let error = null;
   if (result.error) {
     error = { message: result.error.message };
@@ -759,7 +775,7 @@ async function runOneShot(cwd, options = {}) {
     rawStdout: result.stdout,
     markerFound,
     outputSource,
-    resumedFresh: bogusResume,
+    resumedFresh: bogusResume || resumeTargetMismatch,
     reasoningSummary: [],
     turn: { id: conversationId ?? "agy-turn", status: status === 0 ? "completed" : "failed" },
     error,
