@@ -16,6 +16,7 @@ import {
     interruptTurn,
     parseStructuredOutput,
     readOutputSchema,
+    resolveModelWithEffort,
     runReview,
     runTurn
   } from "./lib/antigravity.mjs";
@@ -73,8 +74,11 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
-const MODEL_ALIASES = new Map([["spark", "Gemini 3.5 Flash (Low)"]]);
+// `agy` encodes reasoning effort in the model LABEL suffix ("Gemini 3.5 Flash
+// (High)"), not in a separate flag, so only the three suffix levels exist.
+// Earlier versions also accepted none|minimal|xhigh and then silently dropped
+// the whole flag — a no-op dressed up as a feature.
+const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function printUsage() {
@@ -84,7 +88,7 @@ function printUsage() {
       "  node scripts/antigravity-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/antigravity-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/antigravity-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/antigravity-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [prompt]",
+      "  node scripts/antigravity-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <low|medium|high>] [prompt]",
       "  node scripts/antigravity-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/antigravity-companion.mjs result [job-id] [--json]",
       "  node scripts/antigravity-companion.mjs cancel [job-id] [--json]"
@@ -104,17 +108,6 @@ function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
 }
 
-function normalizeRequestedModel(model) {
-  if (model == null) {
-    return null;
-  }
-  const normalized = String(model).trim();
-  if (!normalized) {
-    return null;
-  }
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
-}
-
 function normalizeReasoningEffort(effort) {
   if (effort == null) {
     return null;
@@ -125,7 +118,8 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: low, medium, high ` +
+        "(agy encodes effort in the model label suffix, e.g. \"Gemini 3.5 Flash (High)\")."
     );
   }
   return normalized;
@@ -693,11 +687,11 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, prompt, write, resumeLast, jobId }) {
   return {
     cwd,
+    // Already effort-resolved to a final agy label (see handleTask).
     model,
-    effort,
     prompt,
     write,
     resumeLast,
@@ -836,8 +830,10 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
+  // Effort folds into the model label right here (agy has no effort flag), so
+  // everything downstream — foreground run, stored background request, worker
+  // replay — carries one final `model` and no separate effort to lose.
+  const model = resolveModelWithEffort(options.model, normalizeReasoningEffort(options.effort));
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -859,7 +855,6 @@ async function handleTask(argv) {
     const request = buildTaskRequest({
       cwd,
       model,
-      effort,
       prompt,
       write,
       resumeLast,
@@ -877,7 +872,6 @@ async function handleTask(argv) {
       executeTaskRun({
         cwd,
         model,
-        effort,
         prompt,
         write,
         resumeLast,

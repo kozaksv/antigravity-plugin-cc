@@ -94,6 +94,49 @@ export function resolveModelAlias(model) {
   return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
 }
 
+/** Family used when `--effort` is given without a model. */
+const DEFAULT_EFFORT_BASE_MODEL = "Gemini 3.5 Flash";
+const EFFORT_SUFFIXES = new Map([
+  ["low", "Low"],
+  ["medium", "Medium"],
+  ["high", "High"]
+]);
+
+/**
+ * `agy` has no effort flag: effort is the `(Low|Medium|High)` suffix of the
+ * model label (see `agy models`). Map a normalized effort onto the model:
+ *  - no effort -> the (alias-resolved) model unchanged;
+ *  - effort + no model -> the default Gemini Flash family at that effort;
+ *  - effort + a label ending in an effort suffix -> suffix replaced;
+ *  - effort + a bare family name ("Gemini 3.5 Flash") -> suffix appended;
+ *  - effort + a label with a NON-effort parenthesized suffix (e.g.
+ *    "Claude Sonnet 4.6 (Thinking)") -> a clear error, because silently
+ *    dropping the flag is exactly the no-op this replaces.
+ */
+export function resolveModelWithEffort(model, effort) {
+  const resolvedModel = resolveModelAlias(model);
+  if (!effort) {
+    return resolvedModel;
+  }
+  const suffix = EFFORT_SUFFIXES.get(String(effort).trim().toLowerCase());
+  if (!suffix) {
+    throw new Error(`Unsupported reasoning effort "${effort}". Use one of: low, medium, high.`);
+  }
+
+  const base = resolvedModel ?? DEFAULT_EFFORT_BASE_MODEL;
+  const suffixMatch = base.match(/^(.*)\s\((?:Low|Medium|High)\)$/);
+  if (suffixMatch) {
+    return `${suffixMatch[1]} (${suffix})`;
+  }
+  if (/\(.+\)\s*$/.test(base)) {
+    throw new Error(
+      `--effort does not apply to model "${base}": its label has no (Low|Medium|High) effort variant in \`agy models\`. ` +
+        "Pick a Gemini model (e.g. `flash`, `pro`) or drop --effort."
+    );
+  }
+  return `${base} (${suffix})`;
+}
+
 function cleanStderr(stderr) {
   return String(stderr ?? "")
     .split(/\r?\n/)

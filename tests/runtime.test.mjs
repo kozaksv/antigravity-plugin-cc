@@ -31,6 +31,7 @@ const {
   readAgyLogFile,
   runReview,
   runTurn,
+  resolveModelWithEffort,
   resolveTurnTimeoutMs,
   parseStructuredOutput,
   assertPromptWithinLimit,
@@ -854,4 +855,53 @@ test("adversarial-review is fail-closed on schema-invalid JSON: explicit validat
   );
 
   assert.equal(promptInvocations(argvLog).length, 1);
+});
+
+// --- B1: --effort maps onto the agy model-label suffix (agy has no effort flag) ---
+
+test("resolveModelWithEffort maps effort onto model labels and fails on non-effort models", () => {
+  // No effort: model (or its alias) passes through untouched.
+  assert.equal(resolveModelWithEffort(null, null), null);
+  assert.equal(resolveModelWithEffort("flash", null), "Gemini 3.5 Flash (Medium)");
+
+  // Effort without a model: default Gemini Flash family at that effort.
+  assert.equal(resolveModelWithEffort(null, "high"), "Gemini 3.5 Flash (High)");
+
+  // Effort replaces an existing (Low|Medium|High) suffix — aliases included.
+  assert.equal(resolveModelWithEffort("flash-low", "high"), "Gemini 3.5 Flash (High)");
+  assert.equal(resolveModelWithEffort("Gemini 3.1 Pro (High)", "low"), "Gemini 3.1 Pro (Low)");
+
+  // Effort appends to a bare family name.
+  assert.equal(resolveModelWithEffort("Gemini 3.5 Flash", "medium"), "Gemini 3.5 Flash (Medium)");
+
+  // A label with a non-effort parenthesized suffix must error, not silently
+  // drop the flag (the pre-1.0.2 behavior this replaces).
+  assert.throws(() => resolveModelWithEffort("sonnet", "high"), /--effort does not apply to model/);
+  assert.throws(() => resolveModelWithEffort(null, "xhigh"), /Unsupported reasoning effort/);
+});
+
+test("task --effort high reaches agy as --model \"Gemini 3.5 Flash (High)\"", () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+
+  const result = run("node", [SCRIPT, "task", "--json", "--effort", "high", "say hi"], { cwd, env });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const [argv] = promptInvocations(argvLog);
+  assert.ok(argv, "expected one agy -p invocation");
+  const modelIndex = argv.indexOf("--model");
+  assert.notEqual(modelIndex, -1, `expected --model in argv ${JSON.stringify(argv)}`);
+  assert.equal(argv[modelIndex + 1], "Gemini 3.5 Flash (High)");
+});
+
+test("task --model sonnet --effort high fails fast with an actionable error (no silent no-op)", () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+
+  const result = run("node", [SCRIPT, "task", "--json", "--model", "sonnet", "--effort", "high", "say hi"], {
+    cwd,
+    env
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /--effort does not apply to model/);
+  // Failed before ever spawning agy.
+  assert.equal(promptInvocations(argvLog).length, 0);
 });
