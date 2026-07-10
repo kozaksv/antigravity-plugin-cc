@@ -4,5 +4,15 @@
   "description": "Use Antigravity (agy) from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "Sergii Kozak"
-  }
+  },
+  "homepage": "https://github.com/kozaksv/antigravity-plugin-cc",
+  "repository": "https://github.com/kozaksv/antigravity-plugin-cc",
+  "license": "Apache-2.0",
+  "keywords": [
+    "antigravity",
+    "agy",
+    "claude-code",
+    "code-review",
+    "delegate"
+  ]
 }
