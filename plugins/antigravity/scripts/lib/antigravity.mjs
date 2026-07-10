@@ -21,15 +21,13 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 
-import { readJsonFile } from "./fs.mjs";
+import { createTempDir, readJsonFile } from "./fs.mjs";
 import {
   binaryAvailable,
   DEFAULT_TERMINATION_GRACE_MS as TERMINATION_GRACE_MS,
   terminateProcessTree
 } from "./process.mjs";
 
-const SERVICE_NAME = "claude_code_antigravity_plugin";
-const TASK_THREAD_PREFIX = "Antigravity Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current conversation state. Pick the next highest-value step and follow through until the task is resolved.";
 
@@ -202,22 +200,6 @@ function cleanupAgyLogFile(logFilePath) {
   } catch {
     // already gone, or never created — nothing to do
   }
-}
-
-function shorten(text, limit = 96) {
-  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
-  if (!normalized) {
-    return "";
-  }
-  if (normalized.length <= limit) {
-    return normalized;
-  }
-  return `${normalized.slice(0, limit - 3)}...`;
-}
-
-function buildTaskThreadName(prompt) {
-  const excerpt = shorten(prompt, 56);
-  return excerpt ? `${TASK_THREAD_PREFIX}: ${excerpt}` : TASK_THREAD_PREFIX;
 }
 
 function emitProgress(onProgress, message, phase = null, extra = {}) {
@@ -651,8 +633,16 @@ export async function getAntigravityAuthStatus(cwd, options = {}) {
 
   const hasGoogleAccount = fs.existsSync(googleAccountPath(env));
 
+  // Run the probe turn from a disposable tmp cwd, NEVER the caller's workspace
+  // cwd: `agy` records the cwd -> conversation id mapping it used in
+  // cache/last_conversations.json (see docs/agy-cli.md), so a probe spawned in
+  // the workspace would overwrite that workspace's "most-recent conversation"
+  // with this throwaway "OK" turn. The next real resume in that workspace would
+  // then lose the fast `-c` path and fall back to the slower, hang-prone
+  // `--conversation <id>` path (see buildAgyArgs).
+  const probeCwd = createTempDir("antigravity-auth-probe-");
   try {
-    const result = await spawnAgyTurn(cwd, "Reply with exactly: OK", {
+    const result = await spawnAgyTurn(probeCwd, "Reply with exactly: OK", {
       env,
       timeoutMs: options.timeoutMs ?? 60 * 1000,
       printTimeout: "45s"
@@ -682,6 +672,13 @@ export async function getAntigravityAuthStatus(cwd, options = {}) {
       detail: error instanceof Error ? error.message : String(error),
       requiresAuth: true
     });
+  } finally {
+    // Best-effort cleanup; a leftover empty tmp dir is harmless.
+    try {
+      fs.rmSync(probeCwd, { recursive: true, force: true });
+    } catch {
+      // already gone, or never created — nothing to do
+    }
   }
 }
 
@@ -918,16 +915,17 @@ export async function runTurn(cwd, options = {}) {
 }
 
 /**
- * `agy` owns conversation history in its own SQLite store keyed by cwd, so there
- * is no plugin-named thread list to search. Cross-session resume relies on the
- * plugin's persisted job records (their stored conversation ids) instead.
+ * `agy` owns conversation history in its own SQLite store keyed by cwd; the
+ * plugin keeps no thread list of its own to search here. Resume instead goes
+ * through this plugin's job records (see `resolveLatestTrackedTaskThread` in
+ * antigravity-companion.mjs), which only cover the CURRENT Claude Code
+ * session — `session-lifecycle-hook.mjs` deletes a session's job records on
+ * SessionEnd, so there is no persisted cross-session history to fall back to.
+ * This function is therefore a stub, not a real lookup: it always returns
+ * null.
  */
 export async function findLatestTaskThread() {
   return null;
-}
-
-export function buildPersistentTaskThreadName(prompt) {
-  return buildTaskThreadName(prompt);
 }
 
 function stripJsonFences(rawOutput) {
@@ -967,4 +965,4 @@ export function readOutputSchema(schemaPath) {
   return readJsonFile(schemaPath);
 }
 
-export { DEFAULT_CONTINUE_PROMPT, SERVICE_NAME, TASK_THREAD_PREFIX };
+export { DEFAULT_CONTINUE_PROMPT };

@@ -6,9 +6,9 @@ import process from "node:process";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { restoreWorkspaceSnapshot } from "./lib/git.mjs";
 import { loadState, resolveStateFile, updateState } from "./lib/state.mjs";
+import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-export const SESSION_ID_ENV = "ANTIGRAVITY_COMPANION_SESSION_ID";
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 
 function readHookInput() {

@@ -289,6 +289,26 @@ test("getAntigravityAuthStatus reports not logged in when the probe fails", asyn
   assert.equal(status.requiresAuth, true);
 });
 
+test("getAntigravityAuthStatus runs its probe from a throwaway tmp cwd, never the workspace cwd", async () => {
+  // The fake agy records the cwd -> conversation id mapping in
+  // <HOME>/.gemini/antigravity-cli/cache/last_conversations.json exactly like
+  // real agy (see fake-agy-fixture.mjs and docs/agy-cli.md). If the auth probe
+  // ran in the workspace cwd, it would overwrite the workspace's own
+  // "most-recent conversation" entry with this disposable "OK" turn, stealing
+  // the fast `-c` resume path from the next real task/review in that workspace.
+  const { env, cwd } = withFakeAgy();
+  const status = await getAntigravityAuthStatus(cwd, { env });
+  assert.equal(status.loggedIn, true);
+
+  const cacheFile = path.join(env.HOME, ".gemini", "antigravity-cli", "cache", "last_conversations.json");
+  const map = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(map, cwd),
+    false,
+    `workspace cwd ${cwd} must not appear in the conversation cache: ${JSON.stringify(map)}`
+  );
+});
+
 test("runTurn captures marker output and the conversation id", async () => {
   const { env, cwd } = withFakeAgy();
   const result = await runTurn(cwd, { prompt: "Investigate the bug", env });
@@ -904,4 +924,55 @@ test("task --model sonnet --effort high fails fast with an actionable error (no 
   assert.match(result.stderr, /--effort does not apply to model/);
   // Failed before ever spawning agy.
   assert.equal(promptInvocations(argvLog).length, 0);
+});
+
+// --- C9: `--timeout-ms 0` must mean "immediate snapshot, no wait" ---
+
+test("status --wait --timeout-ms 0 returns an immediate snapshot instead of falling back to the 240s default", async () => {
+  // Before the fix, `waitForSingleJobSnapshot` computed
+  // `Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS)`:
+  // `Number("0") || DEFAULT` treats 0 as falsy, so an explicit `--timeout-ms 0`
+  // silently fell back to polling for up to 240s instead of returning at once.
+  const { upsertJob } = await import(path.join(PLUGIN_ROOT, "scripts", "lib", "state.mjs"));
+
+  const workspace = makeTempDir("antigravity-status-wait-workspace-");
+  const pluginDataDir = makeTempDir("antigravity-status-wait-data-");
+  const jobId = "task-status-wait-zero";
+
+  // `upsertJob` (like the rest of state.mjs) resolves its state root from
+  // `process.env.CLAUDE_PLUGIN_DATA` directly (no env-override parameter), so
+  // it must be set on THIS process around the write, then restored.
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    upsertJob(workspace, {
+      id: jobId,
+      status: "running",
+      title: "Antigravity Task",
+      summary: "still going",
+      updatedAt: new Date().toISOString()
+    });
+  } finally {
+    if (previousPluginData === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+    }
+  }
+
+  const env = { ...process.env, CLAUDE_PLUGIN_DATA: pluginDataDir };
+  const startedAt = Date.now();
+  const result = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "0", "--json"], {
+    cwd: workspace,
+    env
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.ok(elapsedMs < 5000, `expected an instant no-wait snapshot, took ${elapsedMs}ms`);
+
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.timeoutMs, 0);
+  assert.equal(payload.waitTimedOut, true);
+  assert.equal(payload.job.status, "running");
 });

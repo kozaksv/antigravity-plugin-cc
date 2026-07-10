@@ -239,7 +239,6 @@ function buildAdversarialReviewPrompt(context, focusText) {
   const template = loadPromptTemplate(ROOT_DIR, "adversarial-review");
   const schema = readOutputSchema(REVIEW_SCHEMA);
   return interpolateTemplate(template, {
-    REVIEW_KIND: "Adversarial Review",
     TARGET_LABEL: context.target.label,
     USER_FOCUS: focusText || "No extra focus provided.",
     REVIEW_COLLECTION_GUIDANCE: context.collectionGuidance,
@@ -363,7 +362,16 @@ function findLatestResumableTaskJob(jobs) {
 }
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  // `options.timeoutMs` legitimately can be 0 (an immediate, no-wait snapshot
+  // via `--timeout-ms 0`). `Number(...) || DEFAULT` treats 0 as falsy and
+  // silently replaces it with the 240s default, making an explicit 0 timeout
+  // impossible. Only fall back to the default when timeoutMs is unset or does
+  // not parse to a finite number at all.
+  const parsedTimeoutMs = Number(options.timeoutMs);
+  const timeoutMs =
+    options.timeoutMs != null && Number.isFinite(parsedTimeoutMs)
+      ? Math.max(0, parsedTimeoutMs)
+      : DEFAULT_STATUS_WAIT_TIMEOUT_MS;
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);

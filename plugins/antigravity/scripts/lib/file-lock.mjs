@@ -37,16 +37,28 @@ import path from "node:path";
 import process from "node:process";
 
 const LOCK_POLL_MS = 50;
-const DEFAULT_ACQUIRE_TIMEOUT_MS = 5000;
+/**
+ * Default wait for a contended lock. Sized for the worst REALISTIC pile-up,
+ * with headroom: state.json writers hold the lock across a full
+ * read-prune-write cycle, which on a slow filesystem (network-synced checkout,
+ * saturated disk) can take low hundreds of ms — a burst of a dozen writers
+ * (background worker progress, cancel, session teardown, tests) can therefore
+ * legitimately queue for several seconds. 5s proved too tight exactly there
+ * (stress runs on a Dropbox-synced checkout timed out spuriously); 10s keeps
+ * interactive paths bounded while eliminating that false-contention failure.
+ * Must stay comfortably ABOVE DEFAULT_EMPTY_GRACE_MS so a crashed creator's
+ * empty lock is always reclaimable within one waiter's patience.
+ */
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 10_000;
 /**
  * Empty/unparseable lock younger than this: assume mid-create, wait, never
  * reclaim. PAST this grace an empty lock can only be a creator that died (or
  * failed) between `open(wx)` and its payload write — there is no pid to probe,
  * so it is reclaimed IMMEDIATELY. This threshold must stay well below
  * DEFAULT_ACQUIRE_TIMEOUT_MS: an earlier design kept empty locks in a
- * "not fresh but not yet stale" dead zone (2s..10s) longer than the acquire
- * timeout (5s), so every waiter timed out before the crashed creator's lock
- * ever became reclaimable — a self-sustaining wedge (review escalation P1).
+ * "not fresh but not yet stale" dead zone LONGER than the acquire timeout,
+ * so every waiter timed out before the crashed creator's lock ever became
+ * reclaimable — a self-sustaining wedge (review escalation P1).
  */
 const DEFAULT_EMPTY_GRACE_MS = 2000;
 /** A wedged reaper lock (its owner crashed) older than this is force-cleared. */
