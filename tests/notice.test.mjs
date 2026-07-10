@@ -26,3 +26,9 @@ test("NOTICE files retain the Apache-2.0 boilerplate", () => {
   const rootContent = fs.readFileSync(ROOT_NOTICE, "utf8");
   assert.match(rootContent, /Licensed under the Apache License, Version 2\.0/);
 });
+
+test("NOTICE files RETAIN the upstream copyright line (Apache-2.0 §4(d)), not just a summary sentence", () => {
+  const rootContent = fs.readFileSync(ROOT_NOTICE, "utf8");
+  assert.match(rootContent, /^Copyright 2026 OpenAI/m);
+  assert.match(rootContent, /^Copyright 2026 Sergii Kozak/m);
+});
