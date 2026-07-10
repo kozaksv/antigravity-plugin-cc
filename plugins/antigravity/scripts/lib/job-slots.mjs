@@ -39,6 +39,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { pidIsAlive, reclaimStaleEntry } from "./file-lock.mjs";
 import { resolveStateDir } from "./state.mjs";
 
 /**
@@ -69,23 +70,40 @@ function ensureSlotDir(cwd) {
   return dir;
 }
 
-function pidIsAlive(pid, killImpl) {
-  if (!Number.isFinite(pid)) {
-    return false;
+function parseOwnerPid(raw) {
+  if (!raw || !raw.trim()) {
+    return Number.NaN;
   }
   try {
-    killImpl(pid, 0);
-    return true;
-  } catch (error) {
-    // EPERM: exists but not signalable by us -> still alive. ESRCH: gone.
-    return error?.code !== "ESRCH";
+    return Number(JSON.parse(raw).pid);
+  } catch {
+    return Number.NaN;
   }
+}
+
+/**
+ * Staleness predicate for a slot file, shared between the initial (unlocked)
+ * classification pass below and the TOCTOU-safe reclaim re-check that runs
+ * under the reaper lock in `reclaimStaleEntry`.
+ */
+function isSlotStale(raw, stat, { killImpl, graceMs }) {
+  const ownerPid = parseOwnerPid(raw);
+  if (Number.isFinite(ownerPid)) {
+    return !pidIsAlive(ownerPid, killImpl);
+  }
+  return Date.now() - stat.mtimeMs >= graceMs;
 }
 
 /**
  * Reclaim slot files whose owner pid is dead (or whose empty payload is past the
  * in-flight grace) and return the count of slots still held. Never reaps a slot
  * that is merely mid-create.
+ *
+ * Reclaim itself is delegated to `reclaimStaleEntry`, which serializes
+ * concurrent reclaimers through a short-lived reaper lock and verifies the
+ * entry's content did not change between the staleness check and the
+ * rename-based claim (TOCTOU-safe): a naive read -> decide -> unlink here
+ * would let two readers both "reclaim" the same dead slot at once.
  */
 function reapDeadSlots(slotDir, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
@@ -105,48 +123,31 @@ function reapDeadSlots(slotDir, options = {}) {
     }
     const slotPath = path.join(slotDir, entry);
     let raw;
+    let stat;
     try {
       raw = fs.readFileSync(slotPath, "utf8");
+      stat = fs.statSync(slotPath);
     } catch {
       // Vanished under us (reaped/released by a peer); nothing to count.
       continue;
     }
 
-    let ownerPid = Number.NaN;
-    if (raw.trim()) {
-      try {
-        ownerPid = Number(JSON.parse(raw).pid);
-      } catch {
-        ownerPid = Number.NaN;
-      }
-    }
-
-    if (Number.isFinite(ownerPid)) {
-      if (pidIsAlive(ownerPid, killImpl)) {
-        held += 1;
-      } else {
-        unlinkQuietly(slotPath);
-      }
+    if (!isSlotStale(raw, stat, { killImpl, graceMs })) {
+      held += 1;
       continue;
     }
 
-    // Empty / unparseable: a slot mid-create looks like this for a beat. Keep it
-    // while fresh (assume a peer is writing its pid); reclaim once it is stale.
-    if (isFresh(slotPath, graceMs)) {
-      held += 1;
-    } else {
-      unlinkQuietly(slotPath);
+    const result = reclaimStaleEntry(slotPath, {
+      isStale: (currentRaw, currentStat) => isSlotStale(currentRaw, currentStat, { killImpl, graceMs })
+    });
+    if (result.reclaimed || result.gone) {
+      continue; // no longer held
     }
+    // Busy (another reclaimer is active) or aborted (raced with a fresh
+    // write): conservatively count it as still held for this snapshot.
+    held += 1;
   }
   return held;
-}
-
-function isFresh(slotPath, graceMs) {
-  try {
-    return Date.now() - fs.statSync(slotPath).mtimeMs < graceMs;
-  } catch {
-    return false;
-  }
 }
 
 function unlinkQuietly(slotPath) {

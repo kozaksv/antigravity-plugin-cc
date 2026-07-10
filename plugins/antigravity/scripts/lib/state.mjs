@@ -2,7 +2,9 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import process from "node:process";
 
+import { withFileLock } from "./file-lock.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -55,26 +57,70 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function resolveStateLockFile(cwd) {
+  return `${resolveStateFile(cwd)}.lock`;
+}
+
+function resolveJobLockFile(cwd, jobId) {
+  return `${resolveJobFile(cwd, jobId)}.lock`;
+}
+
+/**
+ * Serialize `contents` to `<filePath>.<pid>.<random>.tmp` in the SAME
+ * directory as `filePath`, then `renameSync` it over the target. `rename` on
+ * the same filesystem is atomic, so readers never observe a partially
+ * written file (the historical failure mode of a direct `writeFileSync` into
+ * the target path).
+ */
+function atomicWriteFileSync(filePath, contents) {
+  const dir = path.dirname(filePath);
+  const tmpPath = path.join(
+    dir,
+    `${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  );
+  fs.writeFileSync(tmpPath, contents, "utf8");
+  try {
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // best effort cleanup
+    }
+    throw error;
+  }
+}
+
+/**
+ * Fail-closed: `defaultState()` is returned ONLY when the state file simply
+ * does not exist yet (ENOENT). Any other read/parse failure (corrupt JSON,
+ * EACCES, EIO, EMFILE, ...) is thrown, not swallowed — silently falling back
+ * to a fresh default state on a corrupt/unreadable file would let a
+ * subsequent write clobber data that might still be recoverable, and would
+ * hide the underlying problem from the caller.
+ */
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
+  let raw;
+  try {
+    raw = fs.readFileSync(stateFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return defaultState();
+    }
+    throw error;
   }
 
-  try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
-  }
+  const parsed = JSON.parse(raw);
+  return {
+    ...defaultState(),
+    ...parsed,
+    config: {
+      ...defaultState().config,
+      ...(parsed.config ?? {})
+    },
+    jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+  };
 }
 
 function pruneJobs(jobs) {
@@ -89,7 +135,14 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+/**
+ * Write `state` to disk. MUST be called with the `state.lock` already held
+ * by the caller (`saveState` / `updateState`) — this function never acquires
+ * a lock itself, so it can be reused as the body of a read-modify-write
+ * section without the O_EXCL lock (which is not reentrant) ever nesting
+ * inside itself.
+ */
+function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
@@ -111,14 +164,30 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  atomicWriteFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
+/** Public single-shot write: takes `state.lock` exactly once around the write. */
+export function saveState(cwd, state) {
+  ensureStateDir(cwd);
+  return withFileLock(resolveStateLockFile(cwd), () => saveStateUnlocked(cwd, state));
+}
+
+/**
+ * Read-modify-write `state.json` entirely under ONE `state.lock` acquisition:
+ * `loadState` (fail-closed — throws on non-ENOENT errors, aborting the write
+ * before `mutate`/`saveStateUnlocked` ever run) -> `mutate` ->
+ * `saveStateUnlocked` (no lock of its own). The lock is taken once here and
+ * never re-entered, since the O_EXCL primitive is not reentrant.
+ */
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  ensureStateDir(cwd);
+  return withFileLock(resolveStateLockFile(cwd), () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -126,21 +195,43 @@ export function generateJobId(prefix = "job") {
   return `${prefix}-${Date.now().toString(36)}-${random}`;
 }
 
+/**
+ * `jobs/<id>.json` is the single canonical source of a job's status (see
+ * `writeJobFile`'s CAS below). `state.json`'s per-job `status` field is
+ * derived, never authoritative: whenever a patch touches `status`, this
+ * overrides it with whatever is currently canonical on disk so `state.json`
+ * can never "outrun" or diverge from `jobs/<id>.json` — including the case
+ * where the patch's own `status` value came from a stale in-memory snapshot
+ * that a concurrent writer has since superseded (e.g. a worker's `completed`
+ * patch racing a `cancel`'s already-committed `cancelled` canonical file).
+ */
+function deriveJobStatusFromCanonical(cwd, jobPatch) {
+  if (!Object.prototype.hasOwnProperty.call(jobPatch, "status")) {
+    return jobPatch;
+  }
+  const canonical = readCanonicalJobOrNull(cwd, jobPatch.id);
+  if (!canonical || typeof canonical.status !== "string" || canonical.status === jobPatch.status) {
+    return jobPatch;
+  }
+  return { ...jobPatch, status: canonical.status };
+}
+
 export function upsertJob(cwd, jobPatch) {
   return updateState(cwd, (state) => {
     const timestamp = nowIso();
-    const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
+    const patch = deriveJobStatusFromCanonical(cwd, jobPatch);
+    const existingIndex = state.jobs.findIndex((job) => job.id === patch.id);
     if (existingIndex === -1) {
       state.jobs.unshift({
         createdAt: timestamp,
         updatedAt: timestamp,
-        ...jobPatch
+        ...patch
       });
       return;
     }
     state.jobs[existingIndex] = {
       ...state.jobs[existingIndex],
-      ...jobPatch,
+      ...patch,
       updatedAt: timestamp
     };
   });
@@ -163,10 +254,48 @@ export function getConfig(cwd) {
   return loadState(cwd).config;
 }
 
+const TERMINAL_JOB_STATUSES = new Set(["cancelled", "completed", "failed"]);
+
+function readCanonicalJobOrNull(cwd, jobId) {
+  const jobFile = resolveJobFile(cwd, jobId);
+  let raw;
+  try {
+    raw = fs.readFileSync(jobFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+  return JSON.parse(raw);
+}
+
+/**
+ * `jobs/<jobId>.json` is the single canonical source of truth for job
+ * status (see module notes). Every write goes through the per-job lock and
+ * re-reads the canonical status under that SAME lock before deciding: once a
+ * job has reached a terminal status (`cancelled` | `completed` | `failed`),
+ * no further write may change its status — not to a different terminal
+ * status (`completed` must never overwrite `cancelled`) and not back to a
+ * non-terminal one. This is what makes a racing writer that computed its
+ * patch from a stale ("running") snapshot safe: by the time it acquires the
+ * lock it re-reads the CURRENT canonical status, not the snapshot it read
+ * earlier.
+ *
+ * A rejected write is a silent no-op (the file on disk is left exactly as
+ * it was) rather than a thrown error, matching every existing call site's
+ * fire-and-forget usage of `writeJobFile`.
+ */
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  withFileLock(resolveJobLockFile(cwd, jobId), () => {
+    const current = readCanonicalJobOrNull(cwd, jobId);
+    if (current && TERMINAL_JOB_STATUSES.has(current.status) && payload.status !== current.status) {
+      return; // CAS reject: terminal status is final.
+    }
+    atomicWriteFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
+  });
   return jobFile;
 }
 
