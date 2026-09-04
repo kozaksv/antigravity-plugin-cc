@@ -37,8 +37,6 @@ export const RESULT_END_MARKER = "===ANTIGRAVITY_RESULT_END===";
 
 /** Default external wait before the runner force-kills the `agy` process. */
 const DEFAULT_TURN_TIMEOUT_MS = 15 * 60 * 1000;
-/** `agy`'s own `--print-timeout` is advisory; keep it under the external kill. */
-const PRINT_TIMEOUT = "600s";
 const MAX_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 /**
@@ -367,8 +365,136 @@ export function detectQuotaExhaustion(logText) {
   return { resetsIn: resetMatch ? resetMatch[1] : null };
 }
 
+/**
+ * Parse an agy duration string (e.g. "2400s", "15m", "1h") or number of seconds.
+ * Returns the duration in whole seconds, or null if invalid / non-positive.
+ */
+export function parseDurationSeconds(raw) {
+  if (raw == null) {
+    return null;
+  }
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : null;
+  }
+  const str = String(raw).trim();
+  if (!str) {
+    return null;
+  }
+  if (/^\d+$/.test(str)) {
+    const num = Number(str);
+    return num > 0 ? num : null;
+  }
+  if (/^\d+s$/.test(str)) {
+    const num = Number(str.slice(0, -1));
+    return num > 0 ? num : null;
+  }
+  if (/^\d+m$/.test(str)) {
+    const num = Number(str.slice(0, -1));
+    return num > 0 ? num * 60 : null;
+  }
+  if (/^\d+h$/.test(str)) {
+    const num = Number(str.slice(0, -1));
+    return num > 0 ? num * 3600 : null;
+  }
+  const match = str.match(/^((?<h>\d+)h)?((?<m>\d+)m)?((?<s>\d+)s)?$/);
+  if (match && (match.groups.h || match.groups.m || match.groups.s)) {
+    const h = match.groups.h ? Number(match.groups.h) : 0;
+    const m = match.groups.m ? Number(match.groups.m) : 0;
+    const s = match.groups.s ? Number(match.groups.s) : 0;
+    const total = h * 3600 + m * 60 + s;
+    return total > 0 ? total : null;
+  }
+  return null;
+}
+
+/**
+ * Resolve turn budget {turnTimeoutMs, printTimeout}.
+ * Invariant: print-timeout < turn timeout always.
+ */
+export function resolveTurnBudget(options = {}) {
+  const env = options.env ?? process.env;
+
+  let isExplicitTurn = false;
+  let turnTimeoutMs = DEFAULT_TURN_TIMEOUT_MS;
+  const explicitTurnMs = Number(options.timeoutMs);
+  if (explicitTurnMs > 0) {
+    isExplicitTurn = true;
+    turnTimeoutMs = explicitTurnMs;
+  } else {
+    const rawTurnEnv = env?.ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS;
+    if (rawTurnEnv != null && String(rawTurnEnv).trim() !== "") {
+      const parsedTurnEnv = Number(rawTurnEnv);
+      if (Number.isFinite(parsedTurnEnv) && parsedTurnEnv > 0) {
+        isExplicitTurn = true;
+        turnTimeoutMs = parsedTurnEnv;
+      } else {
+        process.stderr.write(
+          `Ignoring invalid ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS=${JSON.stringify(String(rawTurnEnv))}; ` +
+            "expected a positive number of milliseconds. Falling back to the default turn timeout.\n"
+        );
+      }
+    }
+  }
+
+  let explicitPrintSec = null;
+  if (options.printTimeout != null) {
+    explicitPrintSec = parseDurationSeconds(options.printTimeout);
+  }
+  if (explicitPrintSec === null) {
+    const rawPrintEnv = env?.ANTIGRAVITY_COMPANION_PRINT_TIMEOUT;
+    if (rawPrintEnv != null && String(rawPrintEnv).trim() !== "") {
+      const parsedPrintEnv = parseDurationSeconds(rawPrintEnv);
+      if (parsedPrintEnv !== null) {
+        explicitPrintSec = parsedPrintEnv;
+      } else {
+        process.stderr.write(
+          `Ignoring invalid ANTIGRAVITY_COMPANION_PRINT_TIMEOUT=${JSON.stringify(String(rawPrintEnv))}; ` +
+            "expected a duration string (e.g. \"2400s\") or number of seconds. Falling back to the default print timeout.\n"
+        );
+      }
+    }
+  }
+
+  const turnSec = Math.floor(turnTimeoutMs / 1000);
+
+  if (explicitPrintSec !== null) {
+    if (explicitPrintSec >= turnSec) {
+      if (!isExplicitTurn) {
+        turnTimeoutMs = (explicitPrintSec + 60) * 1000;
+        return {
+          turnTimeoutMs,
+          printTimeout: `${explicitPrintSec}s`
+        };
+      }
+      const clampedPrintSec = Math.max(1, turnSec - 30);
+      process.stderr.write(
+        `Clamping print-timeout to ${clampedPrintSec}s to maintain invariant below explicit turn timeout (${turnSec}s).\n`
+      );
+      return {
+        turnTimeoutMs,
+        printTimeout: `${clampedPrintSec}s`
+      };
+    }
+    return {
+      turnTimeoutMs,
+      printTimeout: `${explicitPrintSec}s`
+    };
+  }
+
+  const defaultPrintSec = Math.max(1, turnSec - 30);
+  return {
+    turnTimeoutMs,
+    printTimeout: `${defaultPrintSec}s`
+  };
+}
+
+export function resolvePrintTimeout(options = {}) {
+  return resolveTurnBudget(options).printTimeout;
+}
+
 function buildAgyArgs(prompt, options = {}) {
-  const args = ["-p", prompt, "--print-timeout", options.printTimeout ?? PRINT_TIMEOUT];
+  const budget = options.turnBudget ?? resolveTurnBudget(options);
+  const args = ["-p", prompt, "--print-timeout", budget.printTimeout];
 
   // Resume: prefer `-c` (most-recent-in-cwd) — it is the fast path per
   // docs/agy-cli.md. `--conversation <id>` is slower and prone to hanging past
@@ -509,7 +635,8 @@ export function resolveTurnTimeoutMs(options = {}) {
  */
 function spawnAgyTurn(cwd, prompt, options = {}) {
   return new Promise((resolve) => {
-    const args = buildAgyArgs(prompt, options);
+    const budget = resolveTurnBudget(options);
+    const args = buildAgyArgs(prompt, { ...options, turnBudget: budget });
     const child = spawn("agy", args, {
       cwd,
       env: options.env ?? process.env,
@@ -545,7 +672,7 @@ function spawnAgyTurn(cwd, prompt, options = {}) {
     let timedOut = false;
     let spawnError = null;
 
-    const timeoutMs = resolveTurnTimeoutMs(options);
+    const timeoutMs = budget.turnTimeoutMs;
     let killTimer = null;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -595,10 +722,15 @@ function spawnAgyTurn(cwd, prompt, options = {}) {
 }
 
 export function getAntigravityAvailability(cwd, options = {}) {
-  const versionStatus = binaryAvailable("agy", ["--version"], {
-    cwd,
-    env: options.env ?? process.env
-  });
+  const versionStatus = binaryAvailable(
+    "agy",
+    ["--version", "--print-timeout", options.printTimeout ?? "45s"],
+    {
+      cwd,
+      env: options.env ?? process.env,
+      timeout: options.timeoutMs ?? 60 * 1000
+    }
+  );
   if (!versionStatus.available) {
     return versionStatus;
   }
@@ -777,6 +909,7 @@ async function runOneShot(cwd, options = {}) {
     resumeConversationId,
     resumeWithContinue,
     timeoutMs: options.timeoutMs,
+    printTimeout: options.printTimeout,
     onSpawn: options.onSpawn,
     logFilePath
   });
@@ -917,7 +1050,8 @@ export async function runReview(cwd, options = {}) {
     onProgress: options.onProgress,
     onSpawn: options.onSpawn,
     env: options.env,
-    timeoutMs: options.timeoutMs
+    timeoutMs: options.timeoutMs,
+    printTimeout: options.printTimeout
   });
 
   return {

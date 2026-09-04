@@ -16,7 +16,9 @@ function withFakeAgy() {
   installFakeAgy(binDir);
   const argvLog = path.join(makeTempDir("antigravity-command-argv-"), "argv.log");
   const pluginDataDir = makeTempDir("antigravity-command-data-");
-  const env = buildEnv(binDir, { argvLog, CLAUDE_PLUGIN_DATA: pluginDataDir });
+  const env = buildEnv(binDir, { argvLog });
+  // buildEnv не пробрасує довільні ключі — теку даних задаємо явно.
+  env.CLAUDE_PLUGIN_DATA = pluginDataDir;
   const cwd = makeTempDir("antigravity-command-cwd-");
   return { env, cwd, argvLog, pluginDataDir };
 }

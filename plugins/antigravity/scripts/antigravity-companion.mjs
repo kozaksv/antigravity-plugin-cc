@@ -579,6 +579,7 @@ async function executeTaskRun(request) {
     // Rescue tasks invoke tools/git headlessly; skip the permission prompt so a
     // read-only task does not stall waiting for an answer that can never come.
     skipPermissions: true,
+    printTimeout: request.printTimeout,
     onProgress: request.onProgress,
     onSpawn: request.onAgyPid
   });
@@ -683,7 +684,7 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+function buildTaskJob(workspaceRoot, taskMetadata, write, printTimeout) {
   return createCompanionJob({
     prefix: "task",
     kind: "task",
@@ -691,11 +692,12 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    ...(printTimeout ? { printTimeout } : {})
   });
 }
 
-function buildTaskRequest({ cwd, model, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, prompt, write, resumeLast, jobId, printTimeout }) {
   return {
     cwd,
     // Already effort-resolved to a final agy label (see handleTask).
@@ -703,7 +705,8 @@ function buildTaskRequest({ cwd, model, prompt, write, resumeLast, jobId }) {
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    ...(printTimeout ? { printTimeout } : {})
   };
 }
 
@@ -759,7 +762,8 @@ function enqueueBackgroundTask(cwd, job, request) {
     phase: "queued",
     pid: child.pid ?? null,
     logFile,
-    request
+    request,
+    ...(request.printTimeout ? { printTimeout: request.printTimeout } : {})
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
@@ -829,7 +833,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "print-timeout"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -842,6 +846,7 @@ async function handleTask(argv) {
   // everything downstream — foreground run, stored background request, worker
   // replay — carries one final `model` and no separate effort to lose.
   const model = resolveModelWithEffort(options.model, normalizeReasoningEffort(options.effort));
+  const printTimeout = options["print-timeout"] ? String(options["print-timeout"]).trim() : null;
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -859,21 +864,22 @@ async function handleTask(argv) {
     ensureAntigravityAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, printTimeout);
     const request = buildTaskRequest({
       cwd,
       model,
       prompt,
       write,
       resumeLast,
-      jobId: job.id
+      jobId: job.id,
+      printTimeout
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, printTimeout);
   await runForegroundCommand(
     job,
     (progress, ctx) =>
@@ -884,6 +890,7 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        printTimeout,
         onProgress: progress,
         onAgyPid: ctx?.recordAgyPid,
         onSnapshot: ctx?.recordSnapshot
