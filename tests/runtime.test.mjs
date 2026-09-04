@@ -31,6 +31,8 @@ const {
   readAgyLogFile,
   runReview,
   runTurn,
+  resolvePrintTimeout,
+  resolveTurnBudget,
   resolveModelWithEffort,
   resolveTurnTimeoutMs,
   parseStructuredOutput,
@@ -227,6 +229,20 @@ function promptInvocations(argvLog) {
   return readArgvInvocations(argvLog).filter((argv) => argv.includes("-p"));
 }
 
+function captureStderr(callback) {
+  const originalWrite = process.stderr.write;
+  let stderr = "";
+  process.stderr.write = function capture(chunk, ...args) {
+    stderr += String(chunk);
+    return true;
+  };
+  try {
+    return { value: callback(), stderr };
+  } finally {
+    process.stderr.write = originalWrite;
+  }
+}
+
 test("getAntigravityAvailability reports available when agy is on PATH", () => {
   const { env, cwd } = withFakeAgy();
   const previousPath = process.env.PATH;
@@ -249,6 +265,28 @@ test("getAntigravityAvailability reports unavailable when agy is missing", () =>
     assert.equal(status.available, false);
   } finally {
     process.env.PATH = previousPath;
+  }
+});
+
+test("getAntigravityAvailability keeps its 45s print timeout inside the 60s probe budget", () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const previousPath = process.env.PATH;
+  const previousArgvLog = process.env.AGY_FIXTURE_ARGV_LOG;
+  process.env.PATH = env.PATH;
+  process.env.AGY_FIXTURE_ARGV_LOG = argvLog;
+  try {
+    const status = getAntigravityAvailability(cwd);
+    assert.equal(status.available, true);
+    const probeArgv = readArgvInvocations(argvLog).find((argv) => argv.includes("--print-timeout"));
+    assert.ok(probeArgv, "expected the availability probe to pass --print-timeout");
+    assert.equal(probeArgv[probeArgv.indexOf("--print-timeout") + 1], "45s");
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousArgvLog === undefined) {
+      delete process.env.AGY_FIXTURE_ARGV_LOG;
+    } else {
+      process.env.AGY_FIXTURE_ARGV_LOG = previousArgvLog;
+    }
   }
 });
 
@@ -491,6 +529,68 @@ test("runTurn kills a hanging agy process via its own timeout", async () => {
   assert.equal(result.status, 1);
   assert.ok(result.error);
   assert.match(result.error.message, /timeout|terminated/i);
+});
+
+test("resolvePrintTimeout and resolveTurnBudget default print to 30s below the 15-minute turn", () => {
+  const options = { env: {} };
+  assert.equal(resolvePrintTimeout(options), "870s");
+  assert.deepEqual(resolveTurnBudget(options), {
+    turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+    printTimeout: "870s"
+  });
+});
+
+test("resolveTurnBudget raises an implicit turn budget 60s above an explicit print timeout from env", () => {
+  const options = { env: { ANTIGRAVITY_COMPANION_PRINT_TIMEOUT: "2400s" } };
+  assert.equal(resolvePrintTimeout(options), "2400s");
+  assert.deepEqual(resolveTurnBudget(options), {
+    turnTimeoutMs: 2460 * 1000,
+    printTimeout: "2400s"
+  });
+});
+
+test("resolveTurnBudget clamps print 30s below an explicitly fixed turn budget and writes a note", () => {
+  const { value, stderr } = captureStderr(() =>
+    resolveTurnBudget({ timeoutMs: 300000, printTimeout: "2400s", env: {} })
+  );
+  assert.deepEqual(value, { turnTimeoutMs: 300000, printTimeout: "270s" });
+  assert.match(stderr, /print[- ]timeout.*(?:clamp|270s|turn)/i);
+});
+
+test("resolvePrintTimeout falls back to the default for invalid env and writes a note", () => {
+  const { value, stderr } = captureStderr(() =>
+    resolvePrintTimeout({ env: { ANTIGRAVITY_COMPANION_PRINT_TIMEOUT: "not-a-duration" } })
+  );
+  assert.equal(value, "870s");
+  assert.match(
+    stderr,
+    /ANTIGRAVITY_COMPANION_PRINT_TIMEOUT.*invalid|invalid.*ANTIGRAVITY_COMPANION_PRINT_TIMEOUT/i
+  );
+});
+
+test("runTurn forwards an explicit print timeout to agy", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  const result = await runTurn(cwd, { prompt: "explicit print timeout", env, printTimeout: "1234s" });
+  assert.equal(result.status, 0);
+
+  const [argv] = promptInvocations(argvLog);
+  const timeoutIndex = argv.indexOf("--print-timeout");
+  assert.notEqual(timeoutIndex, -1, `expected --print-timeout in ${JSON.stringify(argv)}`);
+  assert.equal(argv[timeoutIndex + 1], "1234s");
+});
+
+test("runTurn defaults agy's print timeout to 870s, not the old 600s ceiling", async () => {
+  const { env, cwd, argvLog } = withFakeAgy();
+  delete env.ANTIGRAVITY_COMPANION_PRINT_TIMEOUT;
+  delete env.ANTIGRAVITY_COMPANION_TURN_TIMEOUT_MS;
+  const result = await runTurn(cwd, { prompt: "default print timeout", env });
+  assert.equal(result.status, 0);
+
+  const [argv] = promptInvocations(argvLog);
+  const timeoutIndex = argv.indexOf("--print-timeout");
+  assert.notEqual(timeoutIndex, -1, `expected --print-timeout in ${JSON.stringify(argv)}`);
+  assert.equal(argv[timeoutIndex + 1], "870s");
+  assert.notEqual(argv[timeoutIndex + 1], "600s");
 });
 
 test("resolveTurnTimeoutMs: explicit options.timeoutMs wins over env and default", () => {
