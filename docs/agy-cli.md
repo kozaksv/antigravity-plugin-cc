@@ -27,7 +27,13 @@
   invocations. This **replaces the re-feed emulation** the brief assumed.
 - **`--print-timeout` (default 5m) is advisory, not a hard kill.** Observed a
   resume process run **>10 minutes** past a `--print-timeout 90s`. The runner
-  MUST impose its own external timeout + process-tree kill.
+  MUST impose its own external timeout + process-tree kill. The plugin coordinates
+  both budgets: `printTimeout` defaults to `turnTimeoutMs - 30s` (870s under the
+  default 15-minute turn kill budget), configurable via `task --print-timeout <dur>`
+  or `ANTIGRAVITY_COMPANION_PRINT_TIMEOUT`. The invariant `printTimeout < turnTimeoutMs`
+  is always enforced: explicit print timeout raises an implicit turn kill budget
+  to `print + 60s`, while an explicit turn budget clamps print timeout to
+  `turn - 30s` with a stderr note.
 
 ---
 
@@ -67,7 +73,7 @@ Key flags for the plugin:
 | `-p` / `--print` / `--prompt` | one-shot non-interactive print | **value flag** — prompt is the next argv. No stdin. |
 | `-c` / `--continue` | resume most-recent conversation **for the cwd** | uses `cache/last_conversations.json` (cwd→id map). Fast resume path. |
 | `--conversation <id>` | resume a specific conversation by UUID | works, but **slower first response** than `-c`; can exceed `--print-timeout`. Bogus id → `Warning: conversation "<id>" not found.` then runs fresh (exit 0). |
-| `--print-timeout <dur>` | wait timeout for print mode (default `5m0s`) | **advisory** — does NOT reliably kill the process. Wrap with your own timeout. |
+| `--print-timeout <dur>` | wait timeout for print mode (default `5m0s`) | **advisory** — does NOT reliably kill the process. Plugin manages this with default 870s (`turn - 30s`), flag `task --print-timeout <dur>`, env `ANTIGRAVITY_COMPANION_PRINT_TIMEOUT`, and hard kill enforcing invariant `print < turn`. |
 | `--model <label>` | model for this session | label form, e.g. `"Gemini 3.5 Flash (Medium)"` (see `agy models`). |
 | `--add-dir <dir>` | add a directory to the workspace (repeatable) | for multi-root rescue. |
 | `--dangerously-skip-permissions` | auto-approve all tool permission prompts | needed for headless/non-interactive agentic runs (otherwise it may block on a permission prompt). |

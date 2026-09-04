@@ -301,7 +301,7 @@ macOS and Linux (POSIX) are supported and tested. Windows is untested and unsupp
 
 - **Prompt is passed via argv.** `agy -p` does not read from stdin. Very long prompts are subject to your OS `ARG_MAX` limit, so the plugin hard-caps the prompt at 128 KiB before spawning `agy`. Large reviews stay under the cap by automatically switching from an inline diff to a lightweight summary that asks Antigravity to inspect the diff itself; a prompt that would still exceed the cap is rejected with a clear error instead of an opaque spawn failure.
 - **No JSON output mode.** `agy` has no `--output-format json` flag. The plugin relies on marker-based plain-text parsing with the transcript JSONL as a fallback, not on a structured CLI flag.
-- **`--print-timeout` is advisory.** It does not reliably kill a stuck `agy` process, so the plugin enforces its own external timeout and process-tree kill.
+- **`--print-timeout` is advisory.** It does not reliably kill a stuck `agy` process, so the plugin enforces its own external timeout and process-tree kill. By default, print timeout is set to 870s (30s below the 15-minute default turn budget) and can be configured via `task --print-timeout <dur>` or `ANTIGRAVITY_COMPANION_PRINT_TIMEOUT` under the invariant `print < turn`. See [docs/agy-cli.md](docs/agy-cli.md) for details.
 
 ## FAQ
 
